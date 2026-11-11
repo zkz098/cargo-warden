@@ -59,6 +59,11 @@ pub fn find_slint_files(dir: &Path) -> Result<Vec<PathBuf>> {
 
 /// Scan `ui_dir` for hex literals not in `unchanged`.
 pub fn scan_unmapped(ui_dir: &Path, unchanged: &[String]) -> Result<BTreeMap<String, Vec<String>>> {
+    tracing::debug!(
+        ui_dir = %ui_dir.display(),
+        unchanged_count = unchanged.len(),
+        "scanning slint files for unmapped hex literals"
+    );
     let unchanged_set: HashSet<String> = unchanged.iter().map(|s| s.to_ascii_lowercase()).collect();
     let re = Regex::new(r"#([0-9a-fA-F]{3,8})\b")?;
     let slint_files = find_slint_files(ui_dir)?;

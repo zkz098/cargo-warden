@@ -20,6 +20,13 @@ pub fn check_file_length(
     ignore_patterns: &[String],
 ) -> Result<Vec<FileLengthReport>> {
     println!("[file-length] scanning files (max allowed lines: {max_lines})...");
+    tracing::debug!(
+        roots = ?paths,
+        max_lines,
+        extensions = ?extensions,
+        ignore_patterns = ?ignore_patterns,
+        "starting file length scan"
+    );
     let mut reports = Vec::new();
 
     let ext_set: Vec<String> = extensions
@@ -47,15 +54,22 @@ pub fn check_file_length(
 
             let path_str = path.to_string_lossy().replace('\\', "/");
             if ignore_patterns.iter().any(|pat| path_str.contains(pat)) {
+                tracing::trace!(file = %path.display(), "skipping ignored path");
                 continue;
             }
 
-            if let Ok(content) = fs::read_to_string(path) {
-                let lines = content.lines().count();
-                reports.push(FileLengthReport {
-                    path: path.to_path_buf(),
-                    lines,
-                });
+            match fs::read_to_string(path) {
+                Ok(content) => {
+                    let lines = content.lines().count();
+                    tracing::trace!(file = %path.display(), lines, "counted file lines");
+                    reports.push(FileLengthReport {
+                        path: path.to_path_buf(),
+                        lines,
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(file = %path.display(), error = %err, "failed to read file; skipping");
+                }
             }
         }
     }

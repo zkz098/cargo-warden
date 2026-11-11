@@ -341,7 +341,17 @@ pub fn check_dag(src_root: &Path, forbid_imports: &[String]) -> Result<()> {
     if !src_root.exists() {
         bail!("Source root does not exist: {}", src_root.display());
     }
+    tracing::debug!(
+        src_root = %src_root.display(),
+        forbid_imports = ?forbid_imports,
+        "starting module dependency DAG analysis"
+    );
     let (nodes, edges) = module_graph(src_root);
+    tracing::trace!(
+        nodes_count = nodes.len(),
+        edges_count = edges.len(),
+        "module dependency graph constructed"
+    );
     println!(
         "[dag] scanned {} top-level module(s) under {}",
         nodes.len(),
@@ -349,6 +359,7 @@ pub fn check_dag(src_root: &Path, forbid_imports: &[String]) -> Result<()> {
     );
 
     let cycles = find_cycles(&nodes, &edges);
+    tracing::trace!(cycles_count = cycles.len(), "cycle detection finished");
     if !cycles.is_empty() {
         let mut msg = String::from("Module dependency cycle(s) detected:\n");
         for c in &cycles {

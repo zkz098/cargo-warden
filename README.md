@@ -160,5 +160,19 @@ features = []
 
 ---
 
+## 🔍 日志与排错 (`tracing`)
+
+项目内置基于 `tracing` 的结构化诊断日志支持，输出自动定向至 `stderr`，不干扰标准命令结果输出：
+
+- **详细度控制**：
+  - `cargo warden check`：默认输出关键步骤与检查结果
+  - `cargo warden check -v`：输出 INFO 级别诊断事件
+  - `cargo warden check -vv`：输出 DEBUG 级别详细日志（扫描路径、配置加载、子进程派生等）
+  - `cargo warden check -vvv`：输出 TRACE 级别超详日志（逐文件行数/AST 解析追踪、忽略规则匹配等）
+  - `cargo warden check -q`：静默模式，仅输出错误信息
+- **环境变量控制**：支持通过 `RUST_LOG` 自定义模块过滤（如 `RUST_LOG=cargo_warden::checks::complexity=trace cargo warden check`）。
+
+---
+
 ## 📄 License
 Licensed under Apache-2.0 or MIT at your option.

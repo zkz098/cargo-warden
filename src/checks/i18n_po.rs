@@ -190,6 +190,13 @@ pub fn check_i18n(
     locales: &[String],
     out_file: &Path,
 ) -> Result<()> {
+    tracing::debug!(
+        lang_dir = %lang_dir.display(),
+        domain,
+        locales = ?locales,
+        out_file = %out_file.display(),
+        "checking i18n catalog synchronization"
+    );
     println!(
         "[i18n] checking catalog sync: {} against {}",
         lang_dir.display(),

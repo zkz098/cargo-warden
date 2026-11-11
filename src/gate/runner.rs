@@ -56,6 +56,7 @@ pub fn scrub_cargo_metadata(command: &mut Command) {
     const EXTRA: &[&str] = &["CARGO_MANIFEST_DIR", "CARGO_CRATE_NAME", "OUT_DIR"];
     for (key, _) in std::env::vars() {
         if key.starts_with("CARGO_PKG_") || EXTRA.contains(&key.as_str()) {
+            tracing::trace!(key = %key, "scrubbed cargo environment variable");
             command.env_remove(key);
         }
     }
@@ -176,6 +177,12 @@ pub fn build_steps(config: &GateConfig, full: bool) -> Vec<Step> {
 
 pub fn run_gate(root: &Path, config: &GateConfig, full: bool, keep_going: bool) -> Result<()> {
     let steps = build_steps(config, full);
+    tracing::debug!(
+        step_count = steps.len(),
+        full,
+        keep_going,
+        "starting gate pipeline execution"
+    );
     println!(
         "[gate] running {} step(s) ({} profile)",
         steps.len(),
@@ -191,6 +198,11 @@ pub fn run_gate(root: &Path, config: &GateConfig, full: bool, keep_going: bool) 
         if let Some(tool) = step.tool
             && !tool_is_installed(tool)
         {
+            tracing::warn!(
+                step = step.name,
+                tool = tool,
+                "tool is not installed; skipping step"
+            );
             println!(
                 "\n==> {}\n    skipped: cargo-{tool} is not installed (run `cargo install cargo-{tool} --locked`)",
                 step.name
@@ -200,6 +212,7 @@ pub fn run_gate(root: &Path, config: &GateConfig, full: bool, keep_going: bool) 
         }
 
         println!("\n==> {}\n    $ {}", step.name, step.rendered());
+        tracing::debug!(step = step.name, command = %step.rendered(), "spawning step process");
         let step_started = Instant::now();
         let mut command = Command::new(step.program);
         command
@@ -216,6 +229,12 @@ pub fn run_gate(root: &Path, config: &GateConfig, full: bool, keep_going: bool) 
             .with_context(|| format!("Failed to spawn `{}`", step.rendered()))?;
 
         let elapsed = step_started.elapsed().as_millis();
+        tracing::trace!(
+            step = step.name,
+            elapsed_ms = elapsed,
+            success = status.success(),
+            "step process completed"
+        );
         if status.success() {
             passed += 1;
             println!("<== {} ok ({} ms)", step.name, elapsed);

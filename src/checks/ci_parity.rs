@@ -52,11 +52,19 @@ pub fn check_ci_parity(
         root.join(ci_file)
     };
 
+    tracing::debug!(
+        ci_file = %full_ci_path.display(),
+        test_patterns = ?test_patterns,
+        ignore_crates = ?ignore_crates,
+        "checking workspace and CI test parity"
+    );
+
     if !full_ci_path.is_file() {
         bail!("CI workflow file not found at: {}", full_ci_path.display());
     }
 
     let members = workspace_members(root)?;
+    tracing::trace!(members = ?members, "retrieved cargo workspace members");
     let active_members: Vec<&String> = members
         .iter()
         .filter(|m| !ignore_crates.contains(m))

@@ -154,6 +154,7 @@ impl<'ast> Visit<'ast> for FileAstScanner {
 
         let name = node.sig.ident.to_string();
         let line = node.sig.ident.span().start().line;
+        tracing::trace!(function = %name, line, score = calc.score, "cognitive complexity calculated");
 
         self.reports.push(ComplexityReport {
             file: self.file.clone(),
@@ -169,6 +170,7 @@ impl<'ast> Visit<'ast> for FileAstScanner {
 
         let name = node.sig.ident.to_string();
         let line = node.sig.ident.span().start().line;
+        tracing::trace!(function = %name, line, score = calc.score, "cognitive complexity calculated");
 
         self.reports.push(ComplexityReport {
             file: self.file.clone(),
@@ -180,6 +182,7 @@ impl<'ast> Visit<'ast> for FileAstScanner {
 }
 
 pub fn analyze_file(path: &Path) -> Result<Vec<ComplexityReport>> {
+    tracing::debug!(path = %path.display(), "analyzing rust file for cognitive complexity");
     let content =
         fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
 
@@ -202,6 +205,13 @@ pub fn check_complexity(
     ignore_patterns: &[String],
 ) -> Result<Vec<ComplexityReport>> {
     println!("[complexity] analyzing cognitive complexity (max allowed: {max_complexity})...");
+    tracing::debug!(
+        roots = ?paths,
+        max_complexity,
+        ignore_tests,
+        ignore_patterns = ?ignore_patterns,
+        "starting cognitive complexity check"
+    );
     let mut all_reports = Vec::new();
     let mut files_scanned = 0;
 
@@ -218,6 +228,7 @@ pub fn check_complexity(
             let path_str = path.to_string_lossy().replace('\\', "/");
 
             if ignore_patterns.iter().any(|pat| path_str.contains(pat)) {
+                tracing::trace!(file = %path.display(), "skipping ignored path");
                 continue;
             }
 
@@ -228,13 +239,24 @@ pub fn check_complexity(
                     || file_name.ends_with("_tests.rs")
                     || file_name == "tests.rs"
                 {
+                    tracing::trace!(file = %path.display(), "skipping test file");
                     continue;
                 }
             }
 
-            if let Ok(file_reports) = analyze_file(path) {
-                files_scanned += 1;
-                all_reports.extend(file_reports);
+            match analyze_file(path) {
+                Ok(file_reports) => {
+                    tracing::trace!(
+                        file = %path.display(),
+                        functions = file_reports.len(),
+                        "analyzed file"
+                    );
+                    files_scanned += 1;
+                    all_reports.extend(file_reports);
+                }
+                Err(err) => {
+                    tracing::warn!(file = %path.display(), error = %err, "failed to parse rust file; skipping");
+                }
             }
         }
     }

@@ -22,6 +22,14 @@ struct Cli {
     #[arg(short = 'C', long, global = true)]
     cwd: Option<PathBuf>,
 
+    /// Increase logging verbosity (-v for info, -vv for debug, -vvv for trace)
+    #[arg(short = 'v', long, action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
+
+    /// Suppress non-essential logging output
+    #[arg(short = 'q', long, global = true)]
+    quiet: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -141,6 +149,33 @@ enum I18nAction {
     },
 }
 
+fn init_tracing(verbose: u8, quiet: bool) {
+    let default_directive = if quiet {
+        "cargo_warden=error"
+    } else {
+        match verbose {
+            0 => "cargo_warden=warn",
+            1 => "cargo_warden=info",
+            2 => "cargo_warden=debug",
+            _ => "cargo_warden=trace",
+        }
+    };
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_directive));
+
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .without_time();
+
+    if verbose >= 2 {
+        builder.with_target(true).init();
+    } else {
+        builder.with_target(false).init();
+    }
+}
+
 fn main() -> Result<()> {
     let mut raw_args: Vec<String> = std::env::args().collect();
     if raw_args.len() > 1 && raw_args[1] == "warden" {
@@ -149,16 +184,26 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse_from(raw_args);
 
+    init_tracing(cli.verbose, cli.quiet);
+    tracing::debug!(
+        verbose = cli.verbose,
+        quiet = cli.quiet,
+        "tracing initialized"
+    );
+
     let base_dir = if let Some(cwd) = &cli.cwd {
         cwd.clone()
     } else {
         std::env::current_dir()?
     };
+    tracing::debug!(base_dir = %base_dir.display(), "base directory resolved");
 
     let config = if let Some(cfg_path) = &cli.config {
+        tracing::debug!(config_path = %cfg_path.display(), "loading explicit configuration file");
         let content = std::fs::read_to_string(cfg_path)?;
         toml::from_str(&content)?
     } else {
+        tracing::debug!("auto-loading warden configuration");
         WardenConfig::load(&base_dir)?
     };
 
