@@ -1,0 +1,67 @@
+# cargo-warden configuration file example
+# Place this file as `warden.toml` or `.warden.toml` in your project root,
+# or define inside `Cargo.toml` as `[workspace.metadata.warden]`.
+
+[dag]
+# Source roots to scan for modules
+roots = ["crates/limedl-core/src"]
+# Modules that should not be depended on by siblings (e.g. assembly/boot points)
+forbid_imports = ["bootstrap"]
+
+[ci_parity]
+# Path to CI workflow file relative to repository root
+workflow = ".github/workflows/ci.yml"
+# Test command patterns to scan for member names
+test_patterns = ["nextest", "llvm-cov"]
+# Packages to exclude from parity requirements (e.g. fuzz targets or external tools)
+ignore_crates = ["fuzz"]
+# Crates expected in Sonar/lcov coverage fan-out loop
+fanout_crates = ["disk", "engine", "http", "store", "types"]
+
+[slint_theme]
+# Directory containing .slint files
+ui_dir = "crates/limedl-native/ui"
+out_file = "crates/limedl-native/ui/theme.slint"
+# Hex colors permitted to stay as raw literals
+unchanged_colors = [
+    "ffffff", "dc2626", "b91c1c", "fecaca", "fef2f2",
+    "0b1104", "6b7280", "ffffff55", "3b076466"
+]
+
+[i18n]
+# Directory containing <locale>/LC_MESSAGES/<domain>.po
+lang_dir = "crates/limedl-native/lang"
+out_file = "crates/limedl-native/src/i18n/catalog.rs"
+domain = "limedl-native"
+locales = ["zh_CN", "zh_TW", "en"]
+
+[complexity]
+# Maximum cognitive complexity score allowed per function/method
+max = 25
+# Directories to scan
+paths = ["crates", "src"]
+# Skip test files (*_test.rs, tests/, etc.)
+ignore_tests = true
+ignore = ["target"]
+
+[file_length]
+# Maximum allowed line count
+max_lines = 800
+# File extensions to check
+extensions = ["rs", "slint"]
+paths = ["crates", "src"]
+ignore = ["target", "tests", "lang"]
+
+[gate]
+# Pinned toolchain for fmt parity with CI
+rustfmt_toolchain = "1.99.0"
+
+[[gate.test_groups]]
+name = "engine"
+packages = ["limedl-types", "limedl-disk", "limedl-store", "limedl-http", "limedl-engine", "limedl-core"]
+features = ["limedl-core/test-utils"]
+
+[[gate.test_groups]]
+name = "native"
+packages = ["limedl-native"]
+features = []

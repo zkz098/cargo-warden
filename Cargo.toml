@@ -1,0 +1,23 @@
+[package]
+name = "cargo-warden"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A unified Cargo plugin and code quality toolkit for Rust and Slint projects"
+repository = "https://github.com/zkz098/cargo-warden"
+keywords = ["cargo-subcommand", "lint", "complexity", "slint", "quality-gate"]
+categories = ["development-tools::cargo-plugins"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "cargo"] }
+proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+syn = { version = "3.0.10", features = ["full", "visit"] }
+toml = "1.2.1"
+walkdir = "2.5.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
