@@ -1,7 +1,7 @@
 //! Module-boundary and dependency DAG checker.
 //!
 //! Validates module dependencies inside a crate source root:
-//! 1. Builds the module dependency graph at top-level module granularity.
+//! 1. Builds the module dependency graph at top-level module granularity using `syn` AST.
 //! 2. Detects module dependency cycles using Tarjan's SCC algorithm.
 //! 3. Enforces forbidden import targets (e.g. assembly/bootstrap modules that must not be depended upon).
 
@@ -9,6 +9,8 @@ use anyhow::{Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use syn::visit::{self, Visit};
+use syn::{ItemUse, Path as SynPath, UseTree};
 
 /// One source file together with the module path it defines.
 #[derive(Debug)]
@@ -56,177 +58,126 @@ fn is_test_file(file_name: &str) -> bool {
     file_name == "tests.rs" || file_name.ends_with("_tests.rs") || file_name.ends_with("_test.rs")
 }
 
-fn skip_line_comment(chars: &[char], mut i: usize) -> usize {
-    while i < chars.len() && chars[i] != '\n' {
-        i += 1;
-    }
-    i
-}
-
-fn skip_block_comment(chars: &[char], mut i: usize) -> usize {
-    let mut depth = 1;
-    i += 2;
-    while i < chars.len() && depth > 0 {
-        if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
-            depth += 1;
-            i += 2;
-        } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
-            depth -= 1;
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    i
-}
-
-fn skip_string_literal(chars: &[char], mut i: usize) -> usize {
-    if i > 0 && (chars[i - 1] == 'r' || chars[i - 1] == 'b') {
-        i += 1;
-        while i < chars.len() && chars[i] == '#' {
-            i += 1;
-        }
-    }
-    i += 1;
-    while i < chars.len() {
-        if chars[i] == '\\' {
-            i += 2;
-        } else if chars[i] == '"' {
-            return i + 1;
-        } else {
-            i += 1;
-        }
-    }
-    i
-}
-
-fn char_literal_len(chars: &[char], i: usize) -> Option<usize> {
-    match chars.get(i + 1) {
-        Some('\\') => (chars.get(i + 3) == Some(&'\'')).then_some(4),
-        Some(_) => (chars.get(i + 2) == Some(&'\'')).then_some(3),
-        None => None,
+fn ident_name(ident: &syn::Ident) -> String {
+    let s = ident.to_string();
+    if let Some(stripped) = s.strip_prefix("r#") {
+        stripped.to_string()
+    } else {
+        s
     }
 }
 
-pub fn strip_noncode(src: &str) -> String {
-    let chars: Vec<char> = src.chars().collect();
-    let mut out = String::with_capacity(src.len());
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '/' && chars.get(i + 1) == Some(&'/') {
-            i = skip_line_comment(&chars, i);
-        } else if c == '/' && chars.get(i + 1) == Some(&'*') {
-            i = skip_block_comment(&chars, i);
-        } else if c == '"' {
-            i = skip_string_literal(&chars, i);
-        } else if let Some(len) = char_literal_len(&chars, i) {
-            i += len;
-        } else {
-            out.push(c);
-            i += 1;
+fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        if attr.path().is_ident("test") {
+            return true;
         }
-    }
-    out
-}
-
-fn use_statements(clean: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let bytes = clean.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let is_use = bytes[i..].starts_with(b"use")
-            && (i == 0 || !is_ident_byte(bytes[i - 1]))
-            && !bytes.get(i + 3).is_some_and(|b| is_ident_byte(*b));
-        if !is_use {
-            i += 1;
-            continue;
-        }
-        let start = i + 3;
-        let mut j = start;
-        let mut depth: i32 = 0;
-        while j < bytes.len() {
-            match bytes[j] {
-                b'{' | b'(' | b'[' => depth += 1,
-                b'}' | b')' | b']' => depth -= 1,
-                b';' if depth <= 0 => break,
-                _ => {}
+        if attr.path().is_ident("cfg") {
+            let mut is_test = false;
+            let _ = attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("test") {
+                    is_test = true;
+                }
+                Ok(())
+            });
+            if is_test {
+                return true;
             }
-            j += 1;
         }
-        out.push(clean[start..j].trim());
-        i = j + 1;
-    }
-    out
+        false
+    })
 }
 
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
+fn is_test_item(item: &syn::Item) -> bool {
+    let attrs = match item {
+        syn::Item::Const(i) => &i.attrs,
+        syn::Item::Enum(i) => &i.attrs,
+        syn::Item::ExternCrate(i) => &i.attrs,
+        syn::Item::Fn(i) => &i.attrs,
+        syn::Item::ForeignMod(i) => &i.attrs,
+        syn::Item::Impl(i) => &i.attrs,
+        syn::Item::Macro(i) => &i.attrs,
+        syn::Item::Mod(i) => &i.attrs,
+        syn::Item::Static(i) => &i.attrs,
+        syn::Item::Struct(i) => &i.attrs,
+        syn::Item::Trait(i) => &i.attrs,
+        syn::Item::TraitAlias(i) => &i.attrs,
+        syn::Item::Type(i) => &i.attrs,
+        syn::Item::Union(i) => &i.attrs,
+        syn::Item::Use(i) => &i.attrs,
+        _ => return false,
+    };
+    has_test_attr(attrs)
 }
 
-fn split_top(tree: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth: i32 = 0;
-    let mut start = 0;
-    for (idx, c) in tree.char_indices() {
-        match c {
-            '{' | '(' | '[' | '<' => depth += 1,
-            '}' | ')' | ']' | '>' => depth -= 1,
-            ',' if depth == 0 => {
-                parts.push(&tree[start..idx]);
-                start = idx + 1;
+fn expand_syn_use_tree(tree: &UseTree, base: &[String], out: &mut Vec<Vec<String>>) {
+    match tree {
+        UseTree::Path(p) => {
+            let mut next = base.to_vec();
+            next.push(ident_name(&p.ident));
+            expand_syn_use_tree(&p.tree, &next, out);
+        }
+        UseTree::Name(n) => {
+            let ident_str = ident_name(&n.ident);
+            if ident_str == "self" && !base.is_empty() {
+                out.push(base.to_vec());
+            } else {
+                let mut full = base.to_vec();
+                full.push(ident_str);
+                out.push(full);
             }
-            _ => {}
+        }
+        UseTree::Rename(r) => {
+            let ident_str = ident_name(&r.ident);
+            if ident_str == "self" && !base.is_empty() {
+                out.push(base.to_vec());
+            } else {
+                let mut full = base.to_vec();
+                full.push(ident_str);
+                out.push(full);
+            }
+        }
+        UseTree::Glob(_) => {
+            if !base.is_empty() {
+                out.push(base.to_vec());
+            }
+        }
+        UseTree::Group(g) => {
+            for item in &g.items {
+                expand_syn_use_tree(item, base, out);
+            }
         }
     }
-    parts.push(&tree[start..]);
-    parts
 }
 
-fn expand_use_tree(tree: &str, base: &[String], out: &mut Vec<Vec<String>>) {
-    for part in split_top(tree) {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
+#[derive(Default)]
+struct ImportVisitor {
+    paths: Vec<Vec<String>>,
+}
+
+impl<'ast> Visit<'ast> for ImportVisitor {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if is_test_item(item) {
+            return;
         }
-        if part.starts_with('{') && part.ends_with('}') {
-            expand_use_tree(&part[1..part.len() - 1], base, out);
-            continue;
+        visit::visit_item(self, item);
+    }
+
+    fn visit_item_use(&mut self, item: &'ast ItemUse) {
+        expand_syn_use_tree(&item.tree, &[], &mut self.paths);
+        visit::visit_item_use(self, item);
+    }
+
+    fn visit_path(&mut self, path: &'ast SynPath) {
+        if let Some(first) = path.segments.first() {
+            let ident_str = ident_name(&first.ident);
+            if ident_str == "crate" || ident_str == "super" || ident_str == "self" {
+                let tokens: Vec<String> =
+                    path.segments.iter().map(|s| ident_name(&s.ident)).collect();
+                self.paths.push(tokens);
+            }
         }
-        if let Some(open) = part.find('{') {
-            let head: Vec<String> = part[..open]
-                .trim()
-                .trim_end_matches(':')
-                .split("::")
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect();
-            let mut nested = base.to_vec();
-            nested.extend(head);
-            let inner = part[open..].trim();
-            let inner = inner
-                .strip_prefix('{')
-                .unwrap_or(inner)
-                .trim_end_matches('}');
-            expand_use_tree(inner, &nested, out);
-            continue;
-        }
-        let leaf = part.split(" as ").next().unwrap_or(part).trim();
-        let mut tokens: Vec<String> = leaf
-            .split("::")
-            .filter(|s| !s.is_empty() && *s != "*")
-            .map(str::to_string)
-            .collect();
-        if tokens.is_empty() {
-            continue;
-        }
-        if tokens[0] == "self" && tokens.len() == 1 {
-            out.push(base.to_vec());
-            continue;
-        }
-        let mut full = base.to_vec();
-        full.append(&mut tokens);
-        out.push(full);
+        visit::visit_path(self, path);
     }
 }
 
@@ -261,50 +212,6 @@ fn top_level(module: &[String]) -> Option<&str> {
     module.first().map(String::as_str)
 }
 
-fn inline_paths(clean: &str, out: &mut Vec<Vec<String>>) {
-    let bytes = clean.as_bytes();
-    for keyword in ["crate", "super", "self"] {
-        let needle = keyword.as_bytes();
-        let mut i = 0;
-        while i + needle.len() < bytes.len() {
-            if &bytes[i..i + needle.len()] != needle {
-                i += 1;
-                continue;
-            }
-            let starts_word = i == 0 || !is_ident_byte(bytes[i - 1]);
-            let after = skip_whitespace(bytes, i + needle.len());
-            if starts_word && bytes[after..].starts_with(b"::") {
-                let mut tokens = vec![keyword.to_string()];
-                parse_path_tail(clean, bytes, i + needle.len(), &mut tokens);
-                out.push(tokens);
-            }
-            i += needle.len();
-        }
-    }
-}
-
-fn skip_whitespace(bytes: &[u8], mut i: usize) -> usize {
-    while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
-        i += 1;
-    }
-    i
-}
-
-fn parse_path_tail(clean: &str, bytes: &[u8], mut j: usize, tokens: &mut Vec<String>) {
-    while bytes[j..].starts_with(b"::") {
-        let name_start = skip_whitespace(bytes, j + 2);
-        let mut name_end = name_start;
-        while bytes.get(name_end).is_some_and(|b| is_ident_byte(*b)) {
-            name_end += 1;
-        }
-        if name_end == name_start {
-            break;
-        }
-        tokens.push(clean[name_start..name_end].to_string());
-        j = skip_whitespace(bytes, name_end);
-    }
-}
-
 pub fn module_graph(src_root: &Path) -> (BTreeSet<String>, BTreeMap<String, BTreeSet<String>>) {
     let mut files = Vec::new();
     collect_source_files(src_root, &[], &mut files);
@@ -323,13 +230,24 @@ pub fn module_graph(src_root: &Path) -> (BTreeSet<String>, BTreeMap<String, BTre
         let Ok(raw) = std::fs::read_to_string(&file.path) else {
             continue;
         };
-        let clean = strip_noncode(&raw);
-        let mut tokens = Vec::new();
-        for stmt in use_statements(&clean) {
-            expand_use_tree(stmt, &[], &mut tokens);
+        let syntax = match syn::parse_file(&raw) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!(
+                    "[dag] warning: skipping {} due to parse error: {err}",
+                    file.path.display()
+                );
+                continue;
+            }
+        };
+        if has_test_attr(&syntax.attrs) {
+            continue;
         }
-        inline_paths(&clean, &mut tokens);
-        for path in tokens {
+
+        let mut visitor = ImportVisitor::default();
+        visitor.visit_file(&syntax);
+
+        for path in visitor.paths {
             let Some(resolved) = resolve_tokens(&path, &file.module) else {
                 continue;
             };

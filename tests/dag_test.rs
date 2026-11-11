@@ -68,3 +68,80 @@ fn test_forbid_imports() {
     let err = res.unwrap_err().to_string();
     assert!(err.contains("Forbidden imports detected"));
 }
+
+#[test]
+fn test_nested_use_and_inline_paths() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    fs::write(src.join("a.rs"), "pub struct Foo; pub fn bar() {}").unwrap();
+    fs::write(src.join("b.rs"), "pub struct Bar;").unwrap();
+
+    // c depends on a (via nested use) and b (via inline type path)
+    fs::write(
+        src.join("c.rs"),
+        r#"
+        use crate::a::{self, Foo, bar as my_bar};
+
+        pub fn test_fn() {
+            my_bar();
+            let _val: crate::b::Bar = crate::b::Bar;
+        }
+        "#,
+    )
+    .unwrap();
+
+    assert!(check_dag(&src, &[]).is_ok());
+}
+
+#[test]
+fn test_cfg_test_skipped() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    // Module A depends on B in production code
+    fs::write(
+        src.join("a.rs"),
+        "use crate::b::bar;\npub fn foo() { bar(); }",
+    )
+    .unwrap();
+
+    // Module B only depends on A inside #[cfg(test)] tests!
+    fs::write(
+        src.join("b.rs"),
+        r#"
+        pub fn bar() {}
+
+        #[cfg(test)]
+        mod tests {
+            use crate::a::foo;
+            #[test]
+            fn it_works() {
+                foo();
+            }
+        }
+        "#,
+    )
+    .unwrap();
+
+    // Production DAG should NOT report a cycle because #[cfg(test)] is skipped!
+    assert!(check_dag(&src, &[]).is_ok());
+}
+
+#[test]
+fn test_raw_identifiers() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+
+    fs::write(src.join("type.rs"), "pub fn test_fn() {}").unwrap();
+    fs::write(
+        src.join("consumer.rs"),
+        "use crate::r#type::test_fn;\npub fn run() { test_fn(); }",
+    )
+    .unwrap();
+
+    assert!(check_dag(&src, &[]).is_ok());
+}
