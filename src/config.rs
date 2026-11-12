@@ -17,7 +17,7 @@ pub struct WardenConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DagConfig {
-    /// Source directories to scan for modules (e.g. ["crates/limedl-core/src"])
+    /// Source directories to scan for modules (e.g. ["crates/my-core/src"])
     pub roots: Vec<PathBuf>,
     /// Top-level modules that must never be imported by other sibling modules
     pub forbid_imports: Vec<String>,

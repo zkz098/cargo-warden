@@ -2,11 +2,15 @@
 name = "cargo-warden"
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+license = "GPL-3.0-only"
 description = "A unified Cargo plugin and code quality toolkit for Rust and Slint projects"
+homepage = "https://github.com/zkz098/cargo-warden"
 repository = "https://github.com/zkz098/cargo-warden"
+readme = "README.md"
 keywords = ["cargo-subcommand", "lint", "complexity", "slint", "quality-gate"]
 categories = ["development-tools::cargo-plugins"]
+exclude = [".github/", ".gitignore", "warden.toml"]
 
 [dependencies]
 anyhow = "1.0.104"
