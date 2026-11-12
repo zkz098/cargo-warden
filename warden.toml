@@ -1,0 +1,26 @@
+# Self-bootstrapped quality configuration for cargo-warden
+
+[dag]
+roots = ["src"]
+forbid_imports = []
+
+[ci_parity]
+workflow = ".github/workflows/ci.yml"
+test_patterns = ["cargo test", "nextest"]
+ignore_crates = []
+fanout_crates = []
+
+[complexity]
+max = 25
+paths = ["src"]
+ignore_tests = true
+ignore = ["target"]
+
+[file_length]
+max_lines = 800
+extensions = ["rs"]
+paths = ["src"]
+ignore = ["target", "tests"]
+
+[gate]
+test_groups = []

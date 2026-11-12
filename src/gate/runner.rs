@@ -78,84 +78,86 @@ pub fn toolchain_is_installed(toolchain: &str) -> bool {
         .any(|line| line.starts_with(toolchain))
 }
 
-pub fn build_steps(config: &GateConfig, full: bool) -> Vec<Step> {
-    let mut steps = Vec::new();
-
-    // 1. Rustfmt step
-    if let Some(pinned) = &config.rustfmt_toolchain {
-        if toolchain_is_installed(pinned) {
-            steps.push(Step {
-                name: "fmt",
-                program: "cargo",
-                tool: None,
-                env: Vec::new(),
-                args: vec![
-                    format!("+{pinned}"),
-                    "fmt".to_string(),
-                    "--all".to_string(),
-                    "--".to_string(),
-                    "--check".to_string(),
-                ],
-            });
-        } else {
-            steps.push(Step::cargo("fmt", &["fmt", "--all", "--", "--check"]));
-        }
-    } else {
-        steps.push(Step::cargo("fmt", &["fmt", "--all", "--", "--check"]));
+fn build_fmt_step(config: &GateConfig) -> Step {
+    if let Some(pinned) = &config.rustfmt_toolchain
+        && toolchain_is_installed(pinned)
+    {
+        return Step {
+            name: "fmt",
+            program: "cargo",
+            tool: None,
+            env: Vec::new(),
+            args: vec![
+                format!("+{pinned}"),
+                "fmt".to_string(),
+                "--all".to_string(),
+                "--".to_string(),
+                "--check".to_string(),
+            ],
+        };
     }
 
-    // 2. Clippy step
-    steps.push(Step::cargo(
-        "clippy",
-        &[
-            "clippy",
-            "--workspace",
-            "--all-targets",
-            "--",
-            "-D",
-            "warnings",
-        ],
-    ));
+    Step::cargo("fmt", &["fmt", "--all", "--", "--check"])
+}
 
-    // 3. Tests / nextest
+fn push_test_steps(steps: &mut Vec<Step>, config: &GateConfig) {
     let has_nextest = tool_is_installed("nextest");
     if config.test_groups.is_empty() {
-        if has_nextest {
-            steps.push(Step::cargo_tool("test", "nextest", &["nextest", "run"]));
+        let step = if has_nextest {
+            Step::cargo_tool("test", "nextest", &["nextest", "run"])
         } else {
-            steps.push(Step::cargo("test", &["test", "--workspace"]));
-        }
-    } else {
-        for group in &config.test_groups {
-            let mut args = if has_nextest {
-                vec!["nextest".to_string(), "run".to_string()]
-            } else {
-                vec!["test".to_string()]
-            };
-            for pkg in &group.packages {
-                args.push("-p".to_string());
-                args.push(pkg.clone());
-            }
-            if !group.features.is_empty() {
-                args.push("--features".to_string());
-                args.push(group.features.join(","));
-            }
-            steps.push(Step {
-                name: "test",
-                program: "cargo",
-                args,
-                tool: if has_nextest { Some("nextest") } else { None },
-                env: Vec::new(),
-            });
-        }
+            Step::cargo("test", &["test", "--workspace"])
+        };
+        steps.push(step);
+        return;
     }
 
-    // 4. Docs step
+    for group in &config.test_groups {
+        let mut args = if has_nextest {
+            vec!["nextest".to_string(), "run".to_string()]
+        } else {
+            vec!["test".to_string()]
+        };
+        for pkg in &group.packages {
+            args.push("-p".to_string());
+            args.push(pkg.clone());
+        }
+        if !group.features.is_empty() {
+            args.push("--features".to_string());
+            args.push(group.features.join(","));
+        }
+        steps.push(Step {
+            name: "test",
+            program: "cargo",
+            args,
+            tool: if has_nextest { Some("nextest") } else { None },
+            env: Vec::new(),
+        });
+    }
+}
+
+pub fn build_steps(config: &GateConfig, full: bool) -> Vec<Step> {
+    let mut steps = vec![
+        build_fmt_step(config),
+        Step::cargo(
+            "clippy",
+            &[
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        ),
+    ];
+
+    push_test_steps(&mut steps, config);
+
     let mut doc_step = Step::cargo("doc", &["doc", "--workspace", "--no-deps"]);
     doc_step.env.push(("RUSTDOCFLAGS", "-D warnings"));
     steps.push(doc_step);
 
-    // 5. Full profile steps
     if full {
         steps.push(Step::cargo_tool(
             "machete",

@@ -18,6 +18,7 @@ A unified Cargo plugin and code quality toolkit for Rust and Slint projects.
 | **文件最大长度守卫** | `cargo warden file-length` | 检测文件物理行数，支持扩展名白名单与路径排除，防止产生难以维护的上帝文件（God Files） |
 | **本地门禁流水线** | `cargo warden gate` | 本地复现 CI 门禁（fmt, clippy, doc, tests, audit），自动清洗子进程 Cargo 环境变量与工具链版本匹配 |
 | **一键综合静态检查** | `cargo warden check` | 毫秒级一键运行当前项目配置的所有静态质量检查，极适合作为 Git pre-commit hook |
+| **Git Hook 自动管理** | `cargo warden hook [install\|uninstall\|status]` | 一键安装、更新、卸载 `pre-commit` / `pre-push` 钩子，安全保留已有自定义脚本 |
 
 ---
 
@@ -100,6 +101,22 @@ cargo warden file-length --max-lines 800 --ext rs --ext slint --paths src/
 cargo warden check
 ```
 读取 `warden.toml` 或 `Cargo.toml` 中的元数据配置，毫秒级快速运行所有静态守卫。
+
+### 8. Git Hook 管理 (`hook`)
+```bash
+# 安装 pre-commit 钩子（默认运行 cargo warden check）
+cargo warden hook install
+
+# 安装 pre-push 钩子运行完整门禁
+cargo warden hook install --hook pre-push --gate
+
+# 查看钩子安装状态
+cargo warden hook status
+
+# 卸载钩子（仅移除 cargo-warden 托管区块，保留原有自定义脚本）
+cargo warden hook uninstall
+```
+- 若仓库中已存在非 `cargo-warden` 管理的 hook，默认拒绝覆盖，可通过 `--append` 追加或 `--force` 替换。
 
 ---
 

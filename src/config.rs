@@ -87,7 +87,7 @@ impl Default for SlintThemeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct I18nConfig {
-    /// Directory holding <locale>/LC_MESSAGES/*.po files
+    /// Directory holding `<locale>/LC_MESSAGES/*.po` files
     pub lang_dir: PathBuf,
     /// Output generated Rust catalog path
     pub out_file: PathBuf,
