@@ -11,7 +11,20 @@ pub struct WardenConfig {
     pub i18n: Option<I18nConfig>,
     pub complexity: Option<ComplexityConfig>,
     pub file_length: Option<FileLengthConfig>,
+    pub check: Option<CheckConfig>,
     pub gate: Option<GateConfig>,
+}
+
+/// Optional Cargo toolchain checks integrated into `cargo warden check`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CheckConfig {
+    /// Run `cargo fmt --all -- --check` during `cargo warden check`
+    pub fmt: bool,
+    /// Run `cargo clippy` during `cargo warden check`
+    pub clippy: bool,
+    /// Run `cargo doc` during `cargo warden check`
+    pub doc: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,13 +169,42 @@ impl Default for FileLengthConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GateConfig {
+    /// Run configured static quality checks (`warden check`) before Cargo steps (default: true)
+    #[serde(default = "default_true")]
+    pub include_checks: bool,
     /// Groups of packages to test
     pub test_groups: Vec<TestGroupConfig>,
     /// Pinned rustfmt version (optional)
     pub rustfmt_toolchain: Option<String>,
+    /// Extra/override arguments passed to `cargo clippy` (defaults to `--workspace --all-targets -- -D warnings`)
+    pub clippy_args: Vec<String>,
+    /// Extra/override arguments passed to `cargo doc` (defaults to `--workspace --no-deps`)
+    pub doc_args: Vec<String>,
+    /// Custom `RUSTDOCFLAGS` for the `doc` step (defaults to `-D warnings`)
+    pub rustdocflags: Option<String>,
+    /// Step names to skip by default (e.g. `["audit"]`)
+    pub skip_steps: Vec<String>,
+}
+
+impl Default for GateConfig {
+    fn default() -> Self {
+        Self {
+            include_checks: true,
+            test_groups: Vec::new(),
+            rustfmt_toolchain: None,
+            clippy_args: Vec::new(),
+            doc_args: Vec::new(),
+            rustdocflags: None,
+            skip_steps: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

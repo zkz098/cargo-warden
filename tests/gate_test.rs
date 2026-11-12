@@ -1,5 +1,5 @@
 use cargo_warden::config::{GateConfig, TestGroupConfig};
-use cargo_warden::gate::runner::{Step, build_steps, scrub_cargo_metadata};
+use cargo_warden::gate::runner::{Step, build_filtered_steps, build_steps, scrub_cargo_metadata};
 use std::process::Command;
 
 #[test]
@@ -30,6 +30,7 @@ fn test_build_steps_with_test_groups_and_missing_toolchain_fallback() {
             packages: vec!["core-a".to_string(), "core-b".to_string()],
             features: vec!["feat1".to_string(), "feat2".to_string()],
         }],
+        ..GateConfig::default()
     };
 
     let steps = build_steps(&cfg, false);
@@ -73,4 +74,38 @@ fn test_scrub_cargo_metadata_removes_cargo_env_vars() {
     // During `cargo test`, Cargo always sets CARGO_MANIFEST_DIR and CARGO_PKG_NAME
     assert!(removed_keys.iter().any(|k| k == "CARGO_MANIFEST_DIR"));
     assert!(removed_keys.iter().any(|k| k == "CARGO_PKG_NAME"));
+}
+
+#[test]
+fn test_build_filtered_steps_and_custom_args() {
+    let cfg = GateConfig {
+        clippy_args: vec![
+            "--all-targets".to_string(),
+            "--".to_string(),
+            "-D".to_string(),
+            "warnings".to_string(),
+        ],
+        doc_args: vec!["--no-deps".to_string(), "--all-features".to_string()],
+        skip_steps: vec!["audit".to_string()],
+        ..GateConfig::default()
+    };
+
+    let filtered = build_filtered_steps(
+        &cfg,
+        true,
+        &["clippy".to_string(), "doc".to_string(), "audit".to_string()],
+        &[],
+    );
+    let names: Vec<&str> = filtered.iter().map(|s| s.name).collect();
+    assert_eq!(names, vec!["clippy", "doc"]);
+
+    assert_eq!(
+        filtered[0].args,
+        vec!["clippy", "--all-targets", "--", "-D", "warnings"]
+    );
+    assert_eq!(filtered[1].args, vec!["doc", "--no-deps", "--all-features"]);
+
+    let skipped = build_filtered_steps(&cfg, false, &[], &["test".to_string()]);
+    let skipped_names: Vec<&str> = skipped.iter().map(|s| s.name).collect();
+    assert_eq!(skipped_names, vec!["fmt", "clippy", "doc"]);
 }

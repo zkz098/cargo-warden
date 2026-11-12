@@ -115,3 +115,60 @@ fn test_missing_member_and_missing_fanout_fail() {
     .unwrap_err();
     assert!(fanout_err.to_string().contains("beta"));
 }
+
+#[test]
+fn test_ci_parity_recognizes_warden_gate_delegation() {
+    use cargo_warden::checks::ci_parity::check_ci_parity_with_gate;
+    use cargo_warden::config::{GateConfig, TestGroupConfig};
+
+    let dir = tempdir().unwrap();
+    create_workspace(dir.path(), &["alpha", "beta"]);
+
+    let wf_path = dir.path().join("ci.yml");
+    fs::write(&wf_path, "run: ./target/debug/cargo-warden gate\n").unwrap();
+
+    // Workspace-wide gate (empty test_groups) covers all members
+    check_ci_parity_with_gate(
+        dir.path(),
+        Path::new("ci.yml"),
+        &[],
+        &[],
+        &[],
+        Some(&GateConfig::default()),
+    )
+    .unwrap();
+
+    // Non-empty test_groups missing beta fails
+    let partial_gate = GateConfig {
+        test_groups: vec![TestGroupConfig {
+            name: "alpha-only".to_string(),
+            packages: vec!["alpha".to_string()],
+            features: vec![],
+        }],
+        ..GateConfig::default()
+    };
+    let err = check_ci_parity_with_gate(
+        dir.path(),
+        Path::new("ci.yml"),
+        &[],
+        &[],
+        &[],
+        Some(&partial_gate),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("beta"));
+
+    // Gate invocation that skips `test` does not count as covering tests
+    fs::write(&wf_path, "run: cargo warden gate --skip test\n").unwrap();
+    assert!(
+        check_ci_parity_with_gate(
+            dir.path(),
+            Path::new("ci.yml"),
+            &[],
+            &[],
+            &[],
+            Some(&GateConfig::default()),
+        )
+        .is_err()
+    );
+}

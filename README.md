@@ -118,8 +118,15 @@ cargo warden file-length --max-lines 800 --ext rs --ext slint --paths src/
 # Run all static checks enabled in warden.toml / Cargo.toml metadata
 cargo warden check
 
-# Run local verification pipeline (fmt, clippy, test/nextest, doc)
+# Also run fmt, clippy, and doc checks (without running the test suite)
+cargo warden check --full
+
+# Run unified verification pipeline (static checks + fmt + clippy + test/nextest + doc)
 cargo warden gate
+
+# Filter or skip specific gate steps
+cargo warden gate --only fmt,clippy,doc
+cargo warden gate --skip test
 
 # Include cargo-machete, cargo-deny, and cargo-audit
 cargo warden gate --full
@@ -184,7 +191,13 @@ extensions = ["rs", "slint"]
 paths = ["crates", "src"]
 ignore = ["target", "tests"]
 
+[check]
+fmt = true
+clippy = false
+doc = false
+
 [gate]
+include_checks = true
 # rustfmt_toolchain = "1.85.0"
 
 [[gate.test_groups]]

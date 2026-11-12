@@ -8,7 +8,8 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
-use crate::config::GateConfig;
+use crate::checks;
+use crate::config::{GateConfig, WardenConfig};
 
 /// A single step in the gate pipeline.
 pub struct Step {
@@ -63,10 +64,10 @@ pub fn scrub_cargo_metadata(command: &mut Command) {
 }
 
 pub fn tool_is_installed(tool: &str) -> bool {
-    Command::new(format!("cargo-{tool}"))
-        .arg("--version")
+    Command::new("cargo")
+        .args([tool, "--version"])
         .output()
-        .is_ok()
+        .is_ok_and(|out| out.status.success())
 }
 
 pub fn toolchain_is_installed(toolchain: &str) -> bool {
@@ -136,10 +137,19 @@ fn push_test_steps(steps: &mut Vec<Step>, config: &GateConfig) {
     }
 }
 
-pub fn build_steps(config: &GateConfig, full: bool) -> Vec<Step> {
-    let mut steps = vec![
-        build_fmt_step(config),
-        Step::cargo(
+/// Options controlling a `cargo warden gate` execution.
+#[derive(Debug, Clone, Default)]
+pub struct GateRunOptions {
+    pub full: bool,
+    pub keep_going: bool,
+    pub skip_checks: bool,
+    pub only: Vec<String>,
+    pub skip: Vec<String>,
+}
+
+fn build_clippy_step(config: &GateConfig) -> Step {
+    if config.clippy_args.is_empty() {
+        return Step::cargo(
             "clippy",
             &[
                 "clippy",
@@ -149,14 +159,47 @@ pub fn build_steps(config: &GateConfig, full: bool) -> Vec<Step> {
                 "-D",
                 "warnings",
             ],
-        ),
-    ];
+        );
+    }
+
+    let mut args = vec!["clippy".to_string()];
+    args.extend(config.clippy_args.iter().cloned());
+    Step {
+        name: "clippy",
+        program: "cargo",
+        args,
+        tool: None,
+        env: Vec::new(),
+    }
+}
+
+fn build_doc_step(config: &GateConfig) -> Step {
+    let args = if config.doc_args.is_empty() {
+        vec![
+            "doc".to_string(),
+            "--workspace".to_string(),
+            "--no-deps".to_string(),
+        ]
+    } else {
+        let mut custom = vec!["doc".to_string()];
+        custom.extend(config.doc_args.iter().cloned());
+        custom
+    };
+
+    Step {
+        name: "doc",
+        program: "cargo",
+        args,
+        tool: None,
+        env: vec![("RUSTDOCFLAGS", "-D warnings")],
+    }
+}
+
+pub fn build_steps(config: &GateConfig, full: bool) -> Vec<Step> {
+    let mut steps = vec![build_fmt_step(config), build_clippy_step(config)];
 
     push_test_steps(&mut steps, config);
-
-    let mut doc_step = Step::cargo("doc", &["doc", "--workspace", "--no-deps"]);
-    doc_step.env.push(("RUSTDOCFLAGS", "-D warnings"));
-    steps.push(doc_step);
+    steps.push(build_doc_step(config));
 
     if full {
         steps.push(Step::cargo_tool(
@@ -177,8 +220,111 @@ pub fn build_steps(config: &GateConfig, full: bool) -> Vec<Step> {
     steps
 }
 
+/// Filter `build_steps` by `--only` and `--skip` (plus `config.skip_steps`).
+pub fn build_filtered_steps(
+    config: &GateConfig,
+    full: bool,
+    only: &[String],
+    skip: &[String],
+) -> Vec<Step> {
+    build_steps(config, full)
+        .into_iter()
+        .filter(|step| {
+            let in_only = only.is_empty() || only.iter().any(|s| s == step.name);
+            let is_skipped = config.skip_steps.iter().any(|s| s == step.name)
+                || skip.iter().any(|s| s == step.name);
+            in_only && !is_skipped
+        })
+        .collect()
+}
+
+/// Run static checks (when enabled) followed by the gate's Cargo toolchain steps.
+pub fn run_gate_with_checks(
+    root: &Path,
+    config: &WardenConfig,
+    opts: &GateRunOptions,
+) -> Result<()> {
+    let gate_cfg = config.gate.clone().unwrap_or_default();
+
+    let run_checks = !opts.skip_checks
+        && gate_cfg.include_checks
+        && !opts.skip.iter().any(|s| s == "checks" || s == "check")
+        && !gate_cfg
+            .skip_steps
+            .iter()
+            .any(|s| s == "checks" || s == "check")
+        && (opts.only.is_empty() || opts.only.iter().any(|s| s == "checks" || s == "check"));
+
+    if run_checks {
+        checks::run_static_checks(config, root)?;
+        println!();
+    }
+
+    let steps = build_filtered_steps(&gate_cfg, opts.full, &opts.only, &opts.skip);
+    if steps.is_empty() {
+        if run_checks {
+            return Ok(());
+        }
+        bail!("No gate steps selected to run");
+    }
+
+    run_steps(
+        root,
+        &steps,
+        gate_cfg.rustdocflags.as_deref(),
+        opts.full,
+        opts.keep_going,
+    )
+}
+
+/// Run Cargo toolchain steps configured for `cargo warden check` (e.g. `fmt`, `clippy`, `doc`).
+pub fn run_check_toolchain_steps(root: &Path, config: &WardenConfig, full: bool) -> Result<()> {
+    let selected: Vec<String> = if full {
+        vec!["fmt".to_string(), "clippy".to_string(), "doc".to_string()]
+    } else if let Some(chk) = &config.check {
+        let mut names = Vec::new();
+        if chk.fmt {
+            names.push("fmt".to_string());
+        }
+        if chk.clippy {
+            names.push("clippy".to_string());
+        }
+        if chk.doc {
+            names.push("doc".to_string());
+        }
+        names
+    } else {
+        Vec::new()
+    };
+
+    if selected.is_empty() {
+        return Ok(());
+    }
+
+    let gate_cfg = config.gate.clone().unwrap_or_default();
+    let steps = build_filtered_steps(&gate_cfg, false, &selected, &[]);
+    println!();
+    run_steps(root, &steps, gate_cfg.rustdocflags.as_deref(), false, false)
+}
+
 pub fn run_gate(root: &Path, config: &GateConfig, full: bool, keep_going: bool) -> Result<()> {
-    let steps = build_steps(config, full);
+    let steps = build_filtered_steps(config, full, &[], &[]);
+    run_steps(
+        root,
+        &steps,
+        config.rustdocflags.as_deref(),
+        full,
+        keep_going,
+    )
+}
+
+fn run_steps(
+    root: &Path,
+    steps: &[Step],
+    custom_rustdocflags: Option<&str>,
+    full: bool,
+    keep_going: bool,
+) -> Result<()> {
     tracing::debug!(
         step_count = steps.len(),
         full,
@@ -196,7 +342,7 @@ pub fn run_gate(root: &Path, config: &GateConfig, full: bool, keep_going: bool) 
     let mut passed = 0usize;
     let started = Instant::now();
 
-    for step in &steps {
+    for step in steps {
         if let Some(tool) = step.tool
             && !tool_is_installed(tool)
         {
@@ -223,6 +369,11 @@ pub fn run_gate(root: &Path, config: &GateConfig, full: bool, keep_going: bool) 
             .env("CARGO_BUILD_WARNINGS", "deny")
             .env("CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse")
             .envs(step.env.iter().copied());
+        if step.name == "doc"
+            && let Some(flags) = custom_rustdocflags
+        {
+            command.env("RUSTDOCFLAGS", flags);
+        }
 
         scrub_cargo_metadata(&mut command);
 

@@ -94,7 +94,7 @@ enum Commands {
         paths: Vec<PathBuf>,
     },
 
-    /// Run the full local pre-commit verification gate
+    /// Run the full local verification gate (static checks + fmt + clippy + test + doc)
     Gate {
         /// Run full whole-workspace checks (machete, deny, audit)
         #[arg(long)]
@@ -102,11 +102,20 @@ enum Commands {
         /// Do not abort on first step failure
         #[arg(long)]
         keep_going: bool,
+        /// Skip static quality checks (`warden check`) before Cargo steps
+        #[arg(long)]
+        skip_checks: bool,
+        /// Run only the specified step(s) (comma-separated: checks,fmt,clippy,test,doc,machete,deny,audit)
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+        /// Skip the specified step(s) (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        skip: Vec<String>,
     },
 
-    /// Run all configured static quality checks in one go
+    /// Run all configured static quality checks (and optional toolchain checks)
     Check {
-        /// Also run slow checks
+        /// Also run fmt, clippy, and doc checks (skips test suite)
         #[arg(long)]
         full: bool,
     },
@@ -284,11 +293,23 @@ fn dispatch_command(command: Commands, config: WardenConfig, base_dir: &Path) ->
             ext,
             paths,
         } => handle_file_length(config, base_dir, max_lines, ext, paths),
-        Commands::Gate { full, keep_going } => {
-            let gate_cfg = config.gate.unwrap_or_default();
-            gate::runner::run_gate(base_dir, &gate_cfg, full, keep_going)
+        Commands::Gate {
+            full,
+            keep_going,
+            skip_checks,
+            only,
+            skip,
+        } => {
+            let opts = gate::runner::GateRunOptions {
+                full,
+                keep_going,
+                skip_checks,
+                only,
+                skip,
+            };
+            gate::runner::run_gate_with_checks(base_dir, &config, &opts)
         }
-        Commands::Check { full: _ } => handle_check(&config, base_dir),
+        Commands::Check { full } => handle_check(&config, base_dir, full),
         Commands::Hook { action } => handle_hook(action, base_dir),
     }
 }
@@ -327,12 +348,13 @@ fn handle_ci_parity(
         ignore
     };
 
-    checks::ci_parity::check_ci_parity(
+    checks::ci_parity::check_ci_parity_with_gate(
         base_dir,
         &wf,
         &ci_cfg.test_patterns,
         &ignored,
         &ci_cfg.fanout_crates,
+        config.gate.as_ref(),
     )
 }
 
@@ -462,67 +484,9 @@ fn handle_file_length(
     Ok(())
 }
 
-fn handle_check(config: &WardenConfig, base_dir: &Path) -> Result<()> {
-    println!("🔍 [warden] running all configured static quality checks...");
-
-    if let Some(fl_cfg) = &config.file_length {
-        let search_paths = join_paths(base_dir, &fl_cfg.paths);
-        checks::file_length::check_file_length(
-            &search_paths,
-            fl_cfg.max_lines,
-            &fl_cfg.extensions,
-            &fl_cfg.ignore,
-        )?;
-    }
-
-    if let Some(comp_cfg) = &config.complexity {
-        let search_paths = join_paths(base_dir, &comp_cfg.paths);
-        checks::complexity::check_complexity(
-            &search_paths,
-            comp_cfg.max,
-            comp_cfg.ignore_tests,
-            &comp_cfg.ignore,
-        )?;
-    }
-
-    if let Some(dag_cfg) = &config.dag {
-        for r in &dag_cfg.roots {
-            checks::dag::check_dag(&base_dir.join(r), &dag_cfg.forbid_imports)?;
-        }
-    }
-
-    if let Some(ci_cfg) = &config.ci_parity {
-        checks::ci_parity::check_ci_parity(
-            base_dir,
-            &ci_cfg.workflow,
-            &ci_cfg.test_patterns,
-            &ci_cfg.ignore_crates,
-            &ci_cfg.fanout_crates,
-        )?;
-    }
-
-    if let Some(theme_cfg) = &config.slint_theme
-        && base_dir.join(&theme_cfg.ui_dir).exists()
-    {
-        checks::slint_theme::check_theme(
-            &base_dir.join(&theme_cfg.ui_dir),
-            &theme_cfg.unchanged_colors,
-        )?;
-    }
-
-    if let Some(i18n_cfg) = &config.i18n
-        && base_dir.join(&i18n_cfg.lang_dir).exists()
-    {
-        checks::i18n_po::check_i18n(
-            &base_dir.join(&i18n_cfg.lang_dir),
-            &i18n_cfg.domain,
-            &i18n_cfg.locales,
-            &base_dir.join(&i18n_cfg.out_file),
-        )?;
-    }
-
-    println!("✨ [warden] all static quality checks passed successfully!");
-    Ok(())
+fn handle_check(config: &WardenConfig, base_dir: &Path, full: bool) -> Result<()> {
+    checks::run_static_checks(config, base_dir)?;
+    gate::runner::run_check_toolchain_steps(base_dir, config, full)
 }
 
 fn handle_hook(action: HookAction, base_dir: &Path) -> Result<()> {

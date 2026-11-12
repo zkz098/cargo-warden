@@ -51,7 +51,15 @@ extensions = ["rs", "slint"]
 paths = ["crates", "src"]
 ignore = ["target", "tests", "lang"]
 
+[check]
+# Optional Cargo toolchain checks during `cargo warden check`
+fmt = true
+clippy = false
+doc = false
+
 [gate]
+# Run configured static checks before Cargo steps (default: true)
+include_checks = true
 # Pinned toolchain for fmt parity with CI (optional)
 # rustfmt_toolchain = "1.85.0"
 

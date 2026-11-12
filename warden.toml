@@ -22,5 +22,9 @@ extensions = ["rs"]
 paths = ["src"]
 ignore = ["target", "tests"]
 
+[check]
+fmt = true
+
 [gate]
+include_checks = true
 test_groups = []
