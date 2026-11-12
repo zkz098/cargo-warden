@@ -210,4 +210,4 @@ features = []
 
 ## License
 
-Licensed under the GNU General Public License v3.0 ([`LICENSE`](LICENSE)).
+Licensed under the GNU General Public License v3.0 or later ([`LICENSE`](LICENSE)).
