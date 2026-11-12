@@ -189,3 +189,39 @@ fn test_non_git_directory_fails() {
     let res = resolve_hooks_dir(dir.path());
     assert!(res.is_err());
 }
+
+#[test]
+fn test_update_and_uninstall_preserve_surrounding_custom_blocks() {
+    let dir = tempdir().unwrap();
+    init_git_repo(dir.path());
+
+    let hooks_dir = resolve_hooks_dir(dir.path()).unwrap();
+    fs::create_dir_all(&hooks_dir).unwrap();
+    let hook_path = hooks_dir.join("pre-commit");
+    fs::write(
+        &hook_path,
+        "#!/usr/bin/env sh\necho before\n\n# >>> cargo-warden >>>\ncargo-warden check\n# <<< cargo-warden <<<\n\necho after\n",
+    )
+    .unwrap();
+
+    // Updating mode replaces only the managed block while keeping before & after
+    install_hook(
+        dir.path(),
+        HookKind::PreCommit,
+        HookMode::Gate,
+        ExistingHookPolicy::Fail,
+    )
+    .unwrap();
+    let updated = fs::read_to_string(&hook_path).unwrap();
+    assert!(updated.contains("echo before"));
+    assert!(updated.contains("echo after"));
+    assert!(updated.contains("cargo-warden gate"));
+
+    // Uninstalling strips only the managed block while keeping before & after
+    let removed = uninstall_hook(dir.path(), HookKind::PreCommit).unwrap();
+    assert!(matches!(removed, UninstallOutcome::RemovedBlock(_)));
+    let remaining = fs::read_to_string(&hook_path).unwrap();
+    assert!(remaining.contains("echo before"));
+    assert!(remaining.contains("echo after"));
+    assert!(!remaining.contains("cargo-warden"));
+}

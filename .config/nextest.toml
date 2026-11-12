@@ -1,0 +1,8 @@
+# Nextest configuration to guard against hanging or deadlocked tests.
+
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 2 }
+
+[profile.ci]
+slow-timeout = { period = "30s", terminate-after = 2 }
+fail-fast = false

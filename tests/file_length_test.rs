@@ -32,3 +32,27 @@ fn test_file_length_exceed() {
             .contains("Maximum file line count exceeded")
     );
 }
+
+#[test]
+fn test_multiple_extensions_ignore_patterns_and_descending_sort() {
+    let dir = tempdir().unwrap();
+    let ignored = dir.path().join("target");
+    fs::create_dir_all(&ignored).unwrap();
+
+    fs::write(dir.path().join("a.rs"), "1\n2\n").unwrap();
+    fs::write(dir.path().join("b.slint"), "1\n2\n3\n4\n5\n").unwrap();
+    fs::write(dir.path().join("README"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
+    fs::write(ignored.join("huge.rs"), "1\n".repeat(100)).unwrap();
+
+    let reports = check_file_length(
+        &[dir.path().to_path_buf()],
+        10,
+        &[".rs".to_string(), "slint".to_string()],
+        &["target".to_string()],
+    )
+    .unwrap();
+
+    assert_eq!(reports.len(), 2);
+    assert_eq!(reports[0].lines, 5);
+    assert_eq!(reports[1].lines, 2);
+}

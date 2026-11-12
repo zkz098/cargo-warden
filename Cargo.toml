@@ -10,7 +10,7 @@ repository = "https://github.com/zkz098/cargo-warden"
 readme = "README.md"
 keywords = ["cargo-subcommand", "lint", "complexity", "slint", "quality-gate"]
 categories = ["development-tools::cargo-plugins"]
-exclude = [".github/", ".gitignore", "warden.toml"]
+exclude = [".config/", ".github/", ".gitignore", "warden.toml"]
 
 [dependencies]
 anyhow = "1.0.104"

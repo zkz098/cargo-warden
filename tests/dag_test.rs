@@ -145,3 +145,58 @@ fn test_raw_identifiers() {
 
     assert!(check_dag(&src, &[]).is_ok());
 }
+
+#[test]
+fn test_super_self_submodules_rename_glob_and_three_node_cycle() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(src.join("alpha")).unwrap();
+    fs::create_dir_all(src.join("beta")).unwrap();
+    fs::create_dir_all(src.join("gamma")).unwrap();
+
+    // alpha -> beta (via super::beta::*)
+    fs::write(
+        src.join("alpha/sub.rs"),
+        "use super::super::beta::*;\npub fn run() { helper(); }\n",
+    )
+    .unwrap();
+    // beta -> gamma (via rename)
+    fs::write(
+        src.join("beta/mod.rs"),
+        "use crate::gamma::val as gval;\npub fn helper() -> i32 { gval() }\n",
+    )
+    .unwrap();
+    // gamma -> alpha (closes 3-node cycle) + self reference (not a cycle by itself)
+    fs::write(
+        src.join("gamma/mod.rs"),
+        "use self::inner::v;\nuse crate::alpha::sub::run;\nmod inner { pub fn v() -> i32 { 1 } }\npub fn val() -> i32 { run(); v() }\n",
+    )
+    .unwrap();
+
+    let err = check_dag(&src, &[]).unwrap_err().to_string();
+    assert!(err.contains("alpha <-> beta <-> gamma"));
+}
+
+#[test]
+fn test_missing_src_root_and_forbidden_self_import_allowed() {
+    let dir = tempdir().unwrap();
+    let missing = dir.path().join("does_not_exist");
+    assert!(check_dag(&missing, &[]).is_err());
+
+    let src = dir.path().join("src");
+    fs::create_dir_all(src.join("bootstrap")).unwrap();
+    fs::write(src.join("core.rs"), "pub fn init() {}\n").unwrap();
+    fs::write(
+        src.join("bootstrap/mod.rs"),
+        "use crate::core::init;\npub fn boot() { init(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("bootstrap/wire.rs"),
+        "use crate::bootstrap::boot;\npub fn start() { boot(); }\n",
+    )
+    .unwrap();
+
+    // bootstrap referencing itself is fine; no non-bootstrap module imports bootstrap
+    assert!(check_dag(&src, &["bootstrap".to_string()]).is_ok());
+}
