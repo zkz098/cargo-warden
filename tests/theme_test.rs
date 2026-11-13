@@ -86,3 +86,87 @@ fn test_theme_generate_components_subdir_and_alpha_hex() {
     assert!(updated.contains("Theme.c3b076466"));
     assert!(updated.contains("#FFFFFF"));
 }
+
+#[test]
+fn test_theme_comments_strings_short_hex_rgb_and_deep_import() {
+    use cargo_warden::checks::slint_theme::{
+        SlintThemeOptions, apply_tokens_with_out_file, collect_theme,
+    };
+
+    let dir = tempdir().unwrap();
+    let ui_dir = dir.path().join("ui");
+    let deep_dir = ui_dir.join("pages/settings");
+    fs::create_dir_all(&deep_dir).unwrap();
+
+    // Comments and string literals should NOT trigger violations or get rewritten
+    let clean = ui_dir.join("clean.slint");
+    fs::write(
+        &clean,
+        r#"
+// Example color #deadbf in comment
+/* Multi-line block comment
+   #badc0d rgb(1, 2, 3) */
+export component Clean {
+    property <string> hint: "Use #123456 or rgba(0, 0, 0, 0.5)";
+    background: #fff; // whitelisted via "ffffff"
+}
+"#,
+    )
+    .unwrap();
+
+    let diags_clean = collect_theme(
+        &ui_dir,
+        &SlintThemeOptions {
+            base_dir: dir.path(),
+            unchanged: &["ffffff".to_string()],
+            respect_gitignore: false,
+            changeset: None,
+            emit_text: false,
+        },
+    )
+    .unwrap();
+    assert!(
+        diags_clean.is_empty(),
+        "unexpected violations in comments/strings: {diags_clean:?}"
+    );
+
+    // Real 3/4-digit hex + rgb/rgba in deep nested file should be caught
+    let panel = deep_dir.join("panel.slint");
+    fs::write(
+        &panel,
+        "export component Panel {\n    background: #abc;\n    border-color: rgba(10, 20, 30, 0.5);\n}\n",
+    )
+    .unwrap();
+
+    let diags = collect_theme(
+        &ui_dir,
+        &SlintThemeOptions {
+            base_dir: dir.path(),
+            unchanged: &["ffffff".to_string()],
+            respect_gitignore: false,
+            changeset: None,
+            emit_text: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(diags.len(), 2, "{diags:?}");
+    assert!(diags[0].message.contains("#abc"));
+    assert!(diags[1].message.contains("rgba(10,20,30,0.5)"));
+
+    // apply_tokens_with_out_file leaves clean.slint comments/strings untouched and computes ../../theme.slint
+    apply_tokens_with_out_file(
+        &ui_dir,
+        &ui_dir.join("theme.slint"),
+        &BTreeMap::new(),
+        &["ffffff".to_string()],
+    )
+    .unwrap();
+
+    let clean_after = fs::read_to_string(&clean).unwrap();
+    assert!(clean_after.contains("#deadbf"));
+    assert!(clean_after.contains("\"Use #123456 or rgba(0, 0, 0, 0.5)\""));
+
+    let panel_after = fs::read_to_string(&panel).unwrap();
+    assert!(panel_after.contains("import { Theme } from \"../../theme.slint\";"));
+    assert!(panel_after.contains("Theme.cabc"));
+}

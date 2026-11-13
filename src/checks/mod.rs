@@ -3,6 +3,7 @@ pub mod complexity;
 pub mod dag;
 pub mod file_length;
 pub mod i18n_po;
+pub mod i18n_source;
 pub mod slint_theme;
 
 use crate::baseline::{BaselineApplyStats, BaselineFile};
@@ -263,6 +264,55 @@ fn run_slint_theme_task(
     }))
 }
 
+/// Optional CLI overrides when invoking `cargo warden i18n check`.
+#[derive(Debug, Clone, Default)]
+pub struct I18nOverrides<'a> {
+    pub lang_dir: Option<PathBuf>,
+    pub out_file: Option<PathBuf>,
+    pub source_dirs: &'a [PathBuf],
+    pub strict: bool,
+    pub check_unused: bool,
+    pub no_placeholders: bool,
+}
+
+/// Collect i18n diagnostics from `I18nConfig` plus optional CLI overrides.
+pub fn collect_i18n_from_config(
+    i18n_cfg: &crate::config::I18nConfig,
+    base_dir: &Path,
+    overrides: &I18nOverrides<'_>,
+    changeset: Option<&BTreeSet<PathBuf>>,
+    emit_text: bool,
+) -> Result<Vec<Diagnostic>> {
+    let ldir = overrides
+        .lang_dir
+        .clone()
+        .unwrap_or_else(|| i18n_cfg.lang_dir.clone());
+    let ofile = overrides
+        .out_file
+        .clone()
+        .unwrap_or_else(|| i18n_cfg.out_file.clone());
+    let src_dirs = if overrides.source_dirs.is_empty() {
+        &i18n_cfg.source_dirs
+    } else {
+        overrides.source_dirs
+    };
+    i18n_po::collect_i18n(&i18n_po::I18nOptions {
+        base_dir,
+        lang_dir: &base_dir.join(ldir),
+        domain: &i18n_cfg.domain,
+        locales: &i18n_cfg.locales,
+        out_file: &base_dir.join(ofile),
+        source_dirs: src_dirs,
+        tr_macros: &i18n_cfg.tr_macros,
+        strict: i18n_cfg.strict || overrides.strict,
+        check_placeholders: i18n_cfg.check_placeholders && !overrides.no_placeholders,
+        check_unused: i18n_cfg.check_unused || overrides.check_unused,
+        respect_gitignore: i18n_cfg.respect_gitignore,
+        changeset,
+        emit_text,
+    })
+}
+
 fn run_i18n_task(
     config: &WardenConfig,
     base_dir: &Path,
@@ -276,15 +326,13 @@ fn run_i18n_task(
         return Ok(None);
     }
     let out_file = base_dir.join(&i18n_cfg.out_file);
-    let diags = i18n_po::collect_i18n(&i18n_po::I18nOptions {
+    let diags = collect_i18n_from_config(
+        i18n_cfg,
         base_dir,
-        lang_dir: &lang_dir,
-        domain: &i18n_cfg.domain,
-        locales: &i18n_cfg.locales,
-        out_file: &out_file,
-        changeset: opts.changeset,
-        emit_text: false,
-    })?;
+        &I18nOverrides::default(),
+        opts.changeset,
+        false,
+    )?;
     let ok_line = (!diags.iter().any(|d| !d.suppressed)).then(|| {
         format!(
             "[i18n] OK: {} is in sync with .po catalogs",
@@ -362,7 +410,12 @@ pub fn run_static_fixes(config: &WardenConfig, base_dir: &Path, emit_text: bool)
                 }
             }
             let mapping = slint_theme::load_token_mapping(base_dir, theme_cfg.theme_def.as_deref());
-            slint_theme::apply_tokens(&ui_dir, &mapping, &theme_cfg.unchanged_colors)?;
+            slint_theme::apply_tokens_with_out_file(
+                &ui_dir,
+                &base_dir.join(&theme_cfg.out_file),
+                &mapping,
+                &theme_cfg.unchanged_colors,
+            )?;
         }
     }
 

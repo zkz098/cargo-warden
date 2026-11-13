@@ -48,6 +48,17 @@ lang_dir = "crates/my-app/lang"
 out_file = "crates/my-app/src/i18n/catalog.rs"
 domain = "my-app"
 locales = ["en", "zh_CN"]
+# Source directories to scan for `@tr(...)` (Slint) and `tr(...)` / `tr!(...)` (Rust) keys
+# source_dirs = ["crates/my-app/ui", "crates/my-app/src"]
+# tr_macros = ["tr", "t", "gettext"]
+# Fail on empty msgstr, #, fuzzy entries, or missing cross-locale keys (default: false)
+strict = false
+# Verify placeholder consistency ({}, {0}, {name}, %s) between msgid and msgstr (default: true)
+check_placeholders = true
+# Flag .po entries no longer referenced in source_dirs (default: false)
+check_unused = false
+# Respect .gitignore rules when scanning source_dirs (default: true)
+respect_gitignore = true
 
 [complexity]
 # Maximum cognitive complexity score allowed per function/method

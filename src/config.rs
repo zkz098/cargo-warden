@@ -159,6 +159,25 @@ pub struct I18nConfig {
     pub domain: String,
     /// Locales order for catalog array
     pub locales: Vec<String>,
+    /// Source directories to scan for `@tr(...)` (Slint) and `tr(...)` / `tr!(...)` (Rust) keys
+    pub source_dirs: Vec<PathBuf>,
+    /// Rust function/macro names treated as translation calls (default: `["tr", "t", "gettext"]`)
+    #[serde(default = "default_tr_macros")]
+    pub tr_macros: Vec<String>,
+    /// Fail when any `.po` entry is empty (`msgstr ""`) or marked `#, fuzzy`
+    pub strict: bool,
+    /// Verify placeholder consistency (`{}`, `{0}`, `{name}`, `%s`, etc.) between `msgid` and `msgstr`
+    #[serde(default = "default_true")]
+    pub check_placeholders: bool,
+    /// Flag `.po` entries that are no longer referenced by any file in `source_dirs`
+    pub check_unused: bool,
+    /// Respect `.gitignore` rules when scanning `source_dirs`
+    #[serde(default = "default_true")]
+    pub respect_gitignore: bool,
+}
+
+fn default_tr_macros() -> Vec<String> {
+    vec!["tr".to_string(), "t".to_string(), "gettext".to_string()]
 }
 
 impl Default for I18nConfig {
@@ -168,6 +187,12 @@ impl Default for I18nConfig {
             out_file: PathBuf::from("src/i18n/catalog.rs"),
             domain: "messages".to_string(),
             locales: vec!["en".to_string()],
+            source_dirs: Vec::new(),
+            tr_macros: default_tr_macros(),
+            strict: false,
+            check_placeholders: true,
+            check_unused: false,
+            respect_gitignore: true,
         }
     }
 }

@@ -299,12 +299,24 @@ pub enum ThemeAction {
 
 #[derive(Subcommand, Debug)]
 pub enum I18nAction {
-    /// Verify that the generated Rust catalog is in sync with .po files
+    /// Verify that the generated Rust catalog, .po quality, and source coverage are valid
     Check {
         #[arg(long)]
         lang_dir: Option<PathBuf>,
         #[arg(long)]
         out_file: Option<PathBuf>,
+        /// Source directories to scan for `@tr(...)` and `tr(...)` / `tr!(...)` keys
+        #[arg(long)]
+        source_dirs: Vec<PathBuf>,
+        /// Fail on empty `msgstr`, `#, fuzzy` entries, or missing cross-locale keys
+        #[arg(long)]
+        strict: bool,
+        /// Flag `.po` entries not referenced in `source_dirs`
+        #[arg(long)]
+        check_unused: bool,
+        /// Disable placeholder consistency validation (`{}`, `{0}`, `%s`, etc.)
+        #[arg(long)]
+        no_placeholders: bool,
     },
     /// Regenerate the Rust catalog lookup table from .po files
     Generate {

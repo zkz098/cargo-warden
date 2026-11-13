@@ -572,3 +572,78 @@ read_only = true
         String::from_utf8_lossy(&fix_out.stderr)
     );
 }
+
+#[test]
+fn test_i18n_cli_source_coverage_strict_and_json() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("ui")).unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::create_dir_all(dir.path().join("locales/zh_CN/LC_MESSAGES")).unwrap();
+
+    fs::write(
+        dir.path().join("ui/app.slint"),
+        "export component App { Text { text: @tr(\"Hi {}\", \"a\"); } Text { text: @tr(\"MissingInPo\"); } }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("locales/zh_CN/LC_MESSAGES/app.po"),
+        r#"
+#, fuzzy
+msgid "Hi {}"
+msgstr "你好"
+
+msgid "UnusedKey"
+msgstr ""
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("warden.toml"),
+        r#"
+[i18n]
+lang_dir = "locales"
+out_file = "src/catalog.rs"
+domain = "app"
+locales = ["zh_CN"]
+"#,
+    )
+    .unwrap();
+
+    // Generate catalog first so catalog sync passes cleanly
+    let gen_out = Command::new(warden_bin())
+        .args(["-C", dir.path().to_str().unwrap(), "i18n", "generate"])
+        .output()
+        .unwrap();
+    assert!(gen_out.status.success());
+
+    // CLI `i18n check --source-dirs ui --strict --check-unused` emits all 4 diagnostic kinds
+    let check_out = Command::new(warden_bin())
+        .args([
+            "-C",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "i18n",
+            "check",
+            "--source-dirs",
+            "ui",
+            "--strict",
+            "--check-unused",
+        ])
+        .output()
+        .unwrap();
+    assert!(!check_out.status.success());
+
+    let report: serde_json::Value = serde_json::from_slice(&check_out.stdout).unwrap();
+    let rules: Vec<&str> = report["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["rule_id"].as_str().unwrap())
+        .collect();
+    assert!(rules.contains(&"warden/i18n-placeholder"), "{rules:?}");
+    assert!(rules.contains(&"warden/i18n-fuzzy"), "{rules:?}");
+    assert!(rules.contains(&"warden/i18n-empty"), "{rules:?}");
+    assert!(rules.contains(&"warden/i18n-missing-key"), "{rules:?}");
+    assert!(rules.contains(&"warden/i18n-unused-key"), "{rules:?}");
+}

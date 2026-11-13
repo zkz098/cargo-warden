@@ -401,3 +401,47 @@ fn is_executable(path: &Path) -> Result<bool> {
 fn is_executable(_path: &Path) -> Result<bool> {
     Ok(true)
 }
+
+/// Print installed Git hook statuses under `base_dir`.
+pub fn print_hook_status(base_dir: &Path) -> Result<()> {
+    for entry in inspect_hooks(base_dir)? {
+        match entry.state {
+            HookState::NotInstalled => {
+                println!(
+                    "  - {}: not installed ({})",
+                    entry.kind.file_name(),
+                    entry.path.display()
+                );
+            }
+            HookState::Managed { mode, executable } => {
+                let mode_str = mode.map_or("unknown", HookMode::label);
+                let exec_str = if executable {
+                    "executable"
+                } else {
+                    "NOT executable"
+                };
+                println!(
+                    "  ✅ {}: managed ({}, {}) [{}]",
+                    entry.kind.file_name(),
+                    mode_str,
+                    exec_str,
+                    entry.path.display()
+                );
+            }
+            HookState::Unmanaged { executable } => {
+                let exec_str = if executable {
+                    "executable"
+                } else {
+                    "NOT executable"
+                };
+                println!(
+                    "  ⚠️  {}: custom/unmanaged ({}) [{}]",
+                    entry.kind.file_name(),
+                    exec_str,
+                    entry.path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}

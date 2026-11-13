@@ -73,21 +73,25 @@ cargo warden ci-parity --workflow .github/workflows/ci.yml
 ### 3. Slint Theme Color Guard (`theme`)
 
 ```bash
-# Check for unmapped hardcoded hex colors
+# Check for unmapped hardcoded colors (#rgb, #rgba, #rrggbb, #rrggbbaa, rgb(), rgba())
+# Comments and string literals are automatically ignored.
 cargo warden theme check --ui-dir ui/
 
-# Rewrite hardcoded hex colors to Theme.c<hex> and inject imports
+# Rewrite hardcoded hex colors to Theme.c<hex> and inject path-relative imports
 cargo warden theme apply --ui-dir ui/
 
 # Generate theme.slint from the configured theme definition
 cargo warden theme generate --out-file ui/theme.slint
 ```
 
-### 4. Gettext `.po` Catalog Sync (`i18n`)
+### 4. Gettext `.po` Catalog Sync, Quality & Source Coverage (`i18n`)
 
 ```bash
-# Verify the generated Rust catalog is up to date with .po files
+# Verify catalog sync, placeholder consistency ({}, {0}, {name}, %s), and source -> .po coverage
 cargo warden i18n check --lang-dir lang/ --out-file src/i18n/catalog.rs
+
+# Enable strict mode (reject empty/fuzzy translations + cross-locale gaps) and source scanning
+cargo warden i18n check --source-dirs crates/my-app/ui --source-dirs crates/my-app/src --strict --check-unused
 
 # Regenerate the Rust lookup table from .po files
 cargo warden i18n generate --lang-dir lang/ --out-file src/i18n/catalog.rs
@@ -214,6 +218,11 @@ lang_dir = "crates/my-app/lang"
 out_file = "crates/my-app/src/i18n/catalog.rs"
 domain = "my-app"
 locales = ["en", "zh_CN"]
+source_dirs = ["crates/my-app/ui", "crates/my-app/src"]
+tr_macros = ["tr", "t", "gettext"]
+strict = false
+check_placeholders = true
+check_unused = false
 
 [complexity]
 max = 25

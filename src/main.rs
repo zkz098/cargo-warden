@@ -454,8 +454,9 @@ fn handle_theme(
             let dir = ui_dir.unwrap_or(theme_cfg.ui_dir);
             let mapping =
                 checks::slint_theme::load_token_mapping(base_dir, theme_cfg.theme_def.as_deref());
-            checks::slint_theme::apply_tokens(
+            checks::slint_theme::apply_tokens_with_out_file(
                 &base_dir.join(dir),
+                &base_dir.join(&theme_cfg.out_file),
                 &mapping,
                 &theme_cfg.unchanged_colors,
             )
@@ -482,24 +483,35 @@ fn handle_i18n(
 ) -> Result<()> {
     let i18n_cfg = config.i18n.clone().unwrap_or_default();
     match action {
-        I18nAction::Check { lang_dir, out_file } => {
-            let ldir = lang_dir.unwrap_or_else(|| i18n_cfg.lang_dir.clone());
-            let ofile = out_file.unwrap_or_else(|| i18n_cfg.out_file.clone());
-            let diagnostics = checks::i18n_po::collect_i18n(&checks::i18n_po::I18nOptions {
+        I18nAction::Check {
+            lang_dir,
+            out_file,
+            source_dirs,
+            strict,
+            check_unused,
+            no_placeholders,
+        } => {
+            let overrides = checks::I18nOverrides {
+                lang_dir,
+                out_file,
+                source_dirs: &source_dirs,
+                strict,
+                check_unused,
+                no_placeholders,
+            };
+            let diagnostics = checks::collect_i18n_from_config(
+                &i18n_cfg,
                 base_dir,
-                lang_dir: &base_dir.join(ldir),
-                domain: &i18n_cfg.domain,
-                locales: &i18n_cfg.locales,
-                out_file: &base_dir.join(ofile),
-                changeset: ctx.changeset.as_ref(),
-                emit_text: !ctx.format.is_structured(),
-            })?;
+                &overrides,
+                ctx.changeset.as_ref(),
+                !ctx.format.is_structured(),
+            )?;
             finish_single_check(
                 diagnostics,
                 &config,
                 base_dir,
                 ctx,
-                "Translation catalog is out of sync with .po catalogs",
+                "Translation catalog validation failed",
             )
         }
         I18nAction::Generate { lang_dir, out_file } => {
@@ -703,7 +715,7 @@ fn handle_hook(action: HookAction, base_dir: &Path) -> Result<()> {
                 }
             }
         }
-        HookAction::Status => handle_hook_status(base_dir),
+        HookAction::Status => hook::print_hook_status(base_dir),
     }
 }
 
@@ -745,48 +757,5 @@ fn handle_hook_install(
         mode.label(),
         path.display()
     );
-    Ok(())
-}
-
-fn handle_hook_status(base_dir: &Path) -> Result<()> {
-    for entry in hook::inspect_hooks(base_dir)? {
-        match entry.state {
-            hook::HookState::NotInstalled => {
-                println!(
-                    "  - {}: not installed ({})",
-                    entry.kind.file_name(),
-                    entry.path.display()
-                );
-            }
-            hook::HookState::Managed { mode, executable } => {
-                let mode_str = mode.map_or("unknown", hook::HookMode::label);
-                let exec_str = if executable {
-                    "executable"
-                } else {
-                    "NOT executable"
-                };
-                println!(
-                    "  ✅ {}: managed ({}, {}) [{}]",
-                    entry.kind.file_name(),
-                    mode_str,
-                    exec_str,
-                    entry.path.display()
-                );
-            }
-            hook::HookState::Unmanaged { executable } => {
-                let exec_str = if executable {
-                    "executable"
-                } else {
-                    "NOT executable"
-                };
-                println!(
-                    "  ⚠️  {}: custom/unmanaged ({}) [{}]",
-                    entry.kind.file_name(),
-                    exec_str,
-                    entry.path.display()
-                );
-            }
-        }
-    }
     Ok(())
 }

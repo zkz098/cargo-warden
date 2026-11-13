@@ -60,15 +60,154 @@ pub fn find_slint_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Scan `ui_dir` for hex literals not in `unchanged`.
+#[derive(Clone, Copy)]
+enum LexState {
+    Normal,
+    LineComment,
+    BlockComment,
+    StringLit { escaped: bool },
+}
+
+fn push_masked_char(out: &mut String, ch: char) {
+    if ch == '\n' {
+        out.push('\n');
+    } else {
+        for _ in 0..ch.len_utf8() {
+            out.push(' ');
+        }
+    }
+}
+
+/// Mask `//`, `/* ... */` comments and `"..."` strings with spaces while preserving byte offsets and newlines.
+fn mask_comments_and_strings(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.char_indices().peekable();
+    let mut state = LexState::Normal;
+
+    while let Some((_, ch)) = chars.next() {
+        state = step_lex_state(state, ch, &mut chars, &mut out);
+    }
+    out
+}
+
+fn step_normal_lex(
+    ch: char,
+    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+    out: &mut String,
+) -> LexState {
+    if ch == '/' && chars.peek().is_some_and(|&(_, next)| next == '/') {
+        push_masked_char(out, ch);
+        if let Some((_, next)) = chars.next() {
+            push_masked_char(out, next);
+        }
+        return LexState::LineComment;
+    }
+    if ch == '/' && chars.peek().is_some_and(|&(_, next)| next == '*') {
+        push_masked_char(out, ch);
+        if let Some((_, next)) = chars.next() {
+            push_masked_char(out, next);
+        }
+        return LexState::BlockComment;
+    }
+    if ch == '"' {
+        push_masked_char(out, ch);
+        return LexState::StringLit { escaped: false };
+    }
+    out.push(ch);
+    LexState::Normal
+}
+
+fn step_lex_state(
+    state: LexState,
+    ch: char,
+    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+    out: &mut String,
+) -> LexState {
+    match state {
+        LexState::Normal => step_normal_lex(ch, chars, out),
+        LexState::LineComment => {
+            push_masked_char(out, ch);
+            if ch == '\n' {
+                LexState::Normal
+            } else {
+                LexState::LineComment
+            }
+        }
+        LexState::BlockComment => {
+            push_masked_char(out, ch);
+            if ch == '*' && chars.peek().is_some_and(|&(_, next)| next == '/') {
+                if let Some((_, next)) = chars.next() {
+                    push_masked_char(out, next);
+                }
+                LexState::Normal
+            } else {
+                LexState::BlockComment
+            }
+        }
+        LexState::StringLit { escaped } => {
+            push_masked_char(out, ch);
+            if escaped {
+                LexState::StringLit { escaped: false }
+            } else if ch == '\\' {
+                LexState::StringLit { escaped: true }
+            } else if ch == '"' {
+                LexState::Normal
+            } else {
+                LexState::StringLit { escaped: false }
+            }
+        }
+    }
+}
+
+fn expand_short_hex(hex: &str) -> Option<String> {
+    if hex.len() != 3 && hex.len() != 4 {
+        return None;
+    }
+    let mut out = String::with_capacity(hex.len() * 2);
+    for ch in hex.chars() {
+        out.push(ch);
+        out.push(ch);
+    }
+    Some(out)
+}
+
+fn is_whitelisted_hex(hex: &str, unchanged_set: &HashSet<String>) -> bool {
+    if unchanged_set.contains(hex) {
+        return true;
+    }
+    expand_short_hex(hex).is_some_and(|expanded| unchanged_set.contains(&expanded))
+}
+
+fn find_unmapped_in_masked_line(
+    masked_line: &str,
+    hex_re: &Regex,
+    rgb_re: &Regex,
+    unchanged_set: &HashSet<String>,
+) -> Vec<(String, String)> {
+    let mut hits = Vec::new();
+    for cap in hex_re.captures_iter(masked_line) {
+        let hex = cap[1].to_ascii_lowercase();
+        if matches!(hex.len(), 3 | 4 | 6 | 8) && !is_whitelisted_hex(&hex, unchanged_set) {
+            hits.push((hex.clone(), format!("#{hex}")));
+        }
+    }
+    for m in rgb_re.find_iter(masked_line) {
+        let expr: String = m.as_str().split_whitespace().collect();
+        hits.push((expr.clone(), expr));
+    }
+    hits
+}
+
+/// Scan `ui_dir` for hex (`#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`) or `rgb()`/`rgba()` literals not in `unchanged`.
 pub fn scan_unmapped(ui_dir: &Path, unchanged: &[String]) -> Result<BTreeMap<String, Vec<String>>> {
     tracing::debug!(
         ui_dir = %ui_dir.display(),
         unchanged_count = unchanged.len(),
-        "scanning slint files for unmapped hex literals"
+        "scanning slint files for unmapped color literals"
     );
     let unchanged_set: HashSet<String> = unchanged.iter().map(|s| s.to_ascii_lowercase()).collect();
-    let re = Regex::new(r"#([0-9a-fA-F]{3,8})\b")?;
+    let hex_re = Regex::new(r"#([0-9a-fA-F]{3,8})\b")?;
+    let rgb_re = Regex::new(r"\brgba?\s*\([^)]*\)")?;
     let slint_files = find_slint_files(ui_dir)?;
     let mut unmapped: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
@@ -78,11 +217,11 @@ pub fn scan_unmapped(ui_dir: &Path, unchanged: &[String]) -> Result<BTreeMap<Str
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| file.display().to_string());
         let text = fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+        let masked = mask_comments_and_strings(&text);
 
-        for cap in re.captures_iter(&text) {
-            let hex = cap[1].to_ascii_lowercase();
-            if (hex.len() == 6 || hex.len() == 8) && !unchanged_set.contains(&hex) {
-                let entry = unmapped.entry(hex).or_default();
+        for line in masked.lines() {
+            for (key, _) in find_unmapped_in_masked_line(line, &hex_re, &rgb_re, &unchanged_set) {
+                let entry = unmapped.entry(key).or_default();
                 if !entry.contains(&file_name) {
                     entry.push(file_name.clone());
                 }
@@ -103,11 +242,11 @@ pub struct SlintThemeOptions<'a> {
     pub emit_text: bool,
 }
 
-/// Collect structured Slint theme diagnostics (line-accurate + inline suppression aware).
+/// Collect structured Slint theme diagnostics (line-accurate, comment/string-safe, inline suppression aware).
 pub fn collect_theme(ui_dir: &Path, opts: &SlintThemeOptions<'_>) -> Result<Vec<Diagnostic>> {
     if opts.emit_text {
         println!(
-            "[slint-theme] scanning {} for unmapped hex literals...",
+            "[slint-theme] scanning {} for unmapped color literals...",
             ui_dir.display()
         );
     }
@@ -115,7 +254,7 @@ pub fn collect_theme(ui_dir: &Path, opts: &SlintThemeOptions<'_>) -> Result<Vec<
         ui_dir = %ui_dir.display(),
         unchanged_count = opts.unchanged.len(),
         respect_gitignore = opts.respect_gitignore,
-        "scanning slint files for unmapped hex literals"
+        "scanning slint files for unmapped color literals"
     );
 
     let slint_exts = vec!["slint".to_string()];
@@ -136,35 +275,36 @@ pub fn collect_theme(ui_dir: &Path, opts: &SlintThemeOptions<'_>) -> Result<Vec<
         .iter()
         .map(|s| s.to_ascii_lowercase())
         .collect();
-    let re = Regex::new(r"#([0-9a-fA-F]{3,8})\b")?;
+    let hex_re = Regex::new(r"#([0-9a-fA-F]{3,8})\b")?;
+    let rgb_re = Regex::new(r"\brgba?\s*\([^)]*\)")?;
     let mut diagnostics = Vec::new();
 
     for file in &slint_files {
         let text = fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+        let masked = mask_comments_and_strings(&text);
         let rel = normalize_rel_path(opts.base_dir, file);
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         let suppressions = FileSuppressions::parse(&text);
 
-        for (idx, line) in text.lines().enumerate() {
+        for (idx, line) in masked.lines().enumerate() {
             let line_no = idx + 1;
-            for cap in re.captures_iter(line) {
-                let hex = cap[1].to_ascii_lowercase();
-                if (hex.len() == 6 || hex.len() == 8) && !unchanged_set.contains(&hex) {
-                    let suppressed = suppressions.is_suppressed("slint-theme", Some(line_no));
-                    diagnostics.push(Diagnostic {
-                        rule_id: "warden/slint-theme".to_string(),
-                        check: "slint-theme".to_string(),
-                        severity: Severity::Error,
-                        message: format!("Unmapped color #{hex} at {}:{}", rel.display(), line_no),
-                        file: Some(rel.clone()),
-                        line: Some(line_no),
-                        column: None,
-                        fingerprint: format!("slint-theme:{rel_str}:{hex}"),
-                        metric_value: None,
-                        suppressed,
-                        suppression_reason: suppressed.then(|| "inline".to_string()),
-                    });
-                }
+            for (key, display) in
+                find_unmapped_in_masked_line(line, &hex_re, &rgb_re, &unchanged_set)
+            {
+                let suppressed = suppressions.is_suppressed("slint-theme", Some(line_no));
+                diagnostics.push(Diagnostic {
+                    rule_id: "warden/slint-theme".to_string(),
+                    check: "slint-theme".to_string(),
+                    severity: Severity::Error,
+                    message: format!("Unmapped color {display} at {}:{}", rel.display(), line_no),
+                    file: Some(rel.clone()),
+                    line: Some(line_no),
+                    column: None,
+                    fingerprint: format!("slint-theme:{rel_str}:{key}"),
+                    metric_value: None,
+                    suppressed,
+                    suppression_reason: suppressed.then(|| "inline".to_string()),
+                });
             }
         }
     }
@@ -186,14 +326,14 @@ pub fn check_theme_with_options(ui_dir: &Path, opts: &SlintThemeOptions<'_>) -> 
     } else {
         if opts.emit_text {
             println!(
-                "[slint-theme] ❌ unmapped hex colors found ({}):",
+                "[slint-theme] ❌ unmapped color literals found ({}):",
                 active.len()
             );
             for d in &active {
                 println!("  {}", d.message);
             }
         }
-        bail!("Unmapped hex colors remain in .slint components");
+        bail!("Unmapped color literals remain in .slint components");
     }
 }
 
@@ -243,9 +383,46 @@ pub fn load_token_mapping(base_dir: &Path, theme_def: Option<&Path>) -> BTreeMap
     mapping
 }
 
-/// Apply tokens across `.slint` files in `ui_dir`.
+fn replace_unmasked_hex(
+    text: &str,
+    masked: &str,
+    token_re: &Regex,
+    mapping: &BTreeMap<String, String>,
+    unchanged_set: &HashSet<String>,
+) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for caps in token_re.captures_iter(masked) {
+        let Some(full) = caps.get(0) else { continue };
+        let hex = caps[1].to_ascii_lowercase();
+        if !matches!(hex.len(), 3 | 4 | 6 | 8) || is_whitelisted_hex(&hex, unchanged_set) {
+            continue;
+        }
+        out.push_str(&text[last..full.start()]);
+        if let Some(token) = mapping.get(&hex) {
+            out.push_str(token);
+        } else {
+            out.push_str(&format!("Theme.c{hex}"));
+        }
+        last = full.end();
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// Apply tokens across `.slint` files in `ui_dir`, assuming `theme.slint` sits directly in `ui_dir`.
 pub fn apply_tokens(
     ui_dir: &Path,
+    mapping: &BTreeMap<String, String>,
+    unchanged: &[String],
+) -> Result<()> {
+    apply_tokens_with_out_file(ui_dir, &ui_dir.join("theme.slint"), mapping, unchanged)
+}
+
+/// Apply tokens across `.slint` files in `ui_dir` with accurate relative imports to `out_file`.
+pub fn apply_tokens_with_out_file(
+    ui_dir: &Path,
+    out_file: &Path,
     mapping: &BTreeMap<String, String>,
     unchanged: &[String],
 ) -> Result<()> {
@@ -256,25 +433,13 @@ pub fn apply_tokens(
 
     for file in &slint_files {
         let text = fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
-        let result = token_re
-            .replace_all(&text, |caps: &regex::Captures| {
-                let hex = caps[1].to_ascii_lowercase();
-                if unchanged_set.contains(&hex) {
-                    return caps[0].to_string();
-                }
-                if let Some(token) = mapping.get(&hex) {
-                    token.clone()
-                } else {
-                    // Default convention: Theme.c<hex>
-                    format!("Theme.c{hex}")
-                }
-            })
-            .into_owned();
+        let masked = mask_comments_and_strings(&text);
+        let result = replace_unmasked_hex(&text, &masked, &token_re, mapping, &unchanged_set);
 
         if result != text {
             let mut final_text = result;
             if !final_text.contains("import { Theme") && !final_text.contains("import {Theme") {
-                final_text = insert_import(&final_text, &theme_import(file));
+                final_text = insert_import(&final_text, &theme_import_to(file, out_file));
             }
             fs::write(file, &final_text).with_context(|| format!("write {}", file.display()))?;
             println!("[slint-theme] updated {}", file.display());
@@ -286,15 +451,37 @@ pub fn apply_tokens(
     Ok(())
 }
 
-fn theme_import(file: &Path) -> String {
-    let is_component = file
-        .parent()
-        .and_then(Path::file_name)
-        .is_some_and(|n| n == "components");
-    let rel = if is_component {
-        "../theme.slint"
+fn normalized_components(path: &Path) -> Vec<std::path::Component<'_>> {
+    path.components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect()
+}
+
+fn theme_import_to(file: &Path, out_file: &Path) -> String {
+    let from_dir = file.parent().unwrap_or_else(|| Path::new(""));
+    let from_parts = normalized_components(from_dir);
+    let to_parts = normalized_components(out_file);
+
+    let common = from_parts
+        .iter()
+        .zip(to_parts.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let mut rel_parts: Vec<String> = Vec::new();
+    for part in &from_parts[common..] {
+        if matches!(part, std::path::Component::Normal(_)) {
+            rel_parts.push("..".to_string());
+        }
+    }
+    for part in &to_parts[common..] {
+        rel_parts.push(part.as_os_str().to_string_lossy().into_owned());
+    }
+
+    let rel = if rel_parts.is_empty() {
+        "theme.slint".to_string()
     } else {
-        "theme.slint"
+        rel_parts.join("/")
     };
     format!("import {{ Theme }} from \"{rel}\";")
 }
