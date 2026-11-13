@@ -37,6 +37,8 @@ impl HookKind {
 pub enum HookMode {
     /// Fast static checks (`cargo warden check`).
     Check,
+    /// Incremental static checks on staged files only (`cargo warden check --staged`).
+    CheckStaged,
     /// Quick local CI gate (`cargo warden gate`).
     Gate,
     /// Full local CI gate (`cargo warden gate --full`).
@@ -48,6 +50,7 @@ impl HookMode {
     pub fn subcommand_args(self) -> &'static str {
         match self {
             HookMode::Check => "check",
+            HookMode::CheckStaged => "check --staged",
             HookMode::Gate => "gate",
             HookMode::GateFull => "gate --full",
         }
@@ -305,6 +308,8 @@ fn detect_mode(block: &str) -> Option<HookMode> {
         Some(HookMode::GateFull)
     } else if block.contains("cargo-warden gate") {
         Some(HookMode::Gate)
+    } else if block.contains("check --staged") {
+        Some(HookMode::CheckStaged)
     } else if block.contains("cargo-warden check") {
         Some(HookMode::Check)
     } else {

@@ -244,6 +244,16 @@ pub fn run_gate_with_checks(
     config: &WardenConfig,
     opts: &GateRunOptions,
 ) -> Result<()> {
+    run_gate_with_static_options(root, config, opts, &checks::StaticRunOptions::default())
+}
+
+/// Run static checks with explicit `StaticRunOptions` followed by the gate's Cargo toolchain steps.
+pub fn run_gate_with_static_options(
+    root: &Path,
+    config: &WardenConfig,
+    opts: &GateRunOptions,
+    static_opts: &checks::StaticRunOptions<'_>,
+) -> Result<()> {
     let gate_cfg = config.gate.clone().unwrap_or_default();
 
     let run_checks = !opts.skip_checks
@@ -256,8 +266,10 @@ pub fn run_gate_with_checks(
         && (opts.only.is_empty() || opts.only.iter().any(|s| s == "checks" || s == "check"));
 
     if run_checks {
-        checks::run_static_checks(config, root)?;
-        println!();
+        checks::run_static_checks_with_options(config, root, static_opts)?;
+        if !static_opts.format.is_structured() {
+            println!();
+        }
     }
 
     let steps = build_filtered_steps(&gate_cfg, opts.full, &opts.only, &opts.skip);

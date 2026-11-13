@@ -6,9 +6,10 @@
 //! 3. (Optional) Sonar/lcov coverage fan-out includes expected crates.
 
 use crate::config::GateConfig;
+use crate::report::{Diagnostic, Severity, normalize_rel_path};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Extract workspace member package names using `cargo metadata`.
@@ -126,25 +127,51 @@ pub fn check_ci_parity(
     )
 }
 
-/// Verify workspace-to-CI parity, recognizing workflows that delegate testing to `cargo warden gate`.
-pub fn check_ci_parity_with_gate(
-    root: &Path,
-    ci_file: &Path,
-    test_patterns: &[String],
-    ignore_crates: &[String],
-    fanout_expected: &[String],
-    gate_cfg: Option<&GateConfig>,
-) -> Result<()> {
-    let full_ci_path = if ci_file.is_absolute() {
-        ci_file.to_path_buf()
+/// Options for running CI parity checks with changeset and structured output support.
+#[derive(Debug, Clone)]
+pub struct CiParityOptions<'a> {
+    pub ci_file: &'a Path,
+    pub test_patterns: &'a [String],
+    pub ignore_crates: &'a [String],
+    pub fanout_expected: &'a [String],
+    pub gate_cfg: Option<&'a GateConfig>,
+    pub changeset: Option<&'a BTreeSet<PathBuf>>,
+    pub emit_text: bool,
+}
+
+fn should_run_in_changeset(ci_file: &Path, changeset: &BTreeSet<PathBuf>) -> bool {
+    let ci_str = ci_file.to_string_lossy().replace('\\', "/");
+    changeset.iter().any(|p| {
+        let s = p.to_string_lossy().replace('\\', "/");
+        s == ci_str
+            || s == "Cargo.toml"
+            || s.ends_with("/Cargo.toml")
+            || s == "warden.toml"
+            || s == ".warden.toml"
+    })
+}
+
+/// Collect structured CI parity diagnostics.
+pub fn collect_ci_parity(root: &Path, opts: &CiParityOptions<'_>) -> Result<Vec<Diagnostic>> {
+    if let Some(changed) = opts.changeset
+        && !should_run_in_changeset(opts.ci_file, changed)
+    {
+        tracing::info!(
+            "skipping ci-parity check (no Cargo.toml, warden.toml, or workflow changes)"
+        );
+        return Ok(Vec::new());
+    }
+
+    let full_ci_path = if opts.ci_file.is_absolute() {
+        opts.ci_file.to_path_buf()
     } else {
-        root.join(ci_file)
+        root.join(opts.ci_file)
     };
 
     tracing::debug!(
         ci_file = %full_ci_path.display(),
-        test_patterns = ?test_patterns,
-        ignore_crates = ?ignore_crates,
+        test_patterns = ?opts.test_patterns,
+        ignore_crates = ?opts.ignore_crates,
         "checking workspace and CI test parity"
     );
 
@@ -156,25 +183,41 @@ pub fn check_ci_parity_with_gate(
     tracing::trace!(members = ?members, "retrieved cargo workspace members");
     let active_members: Vec<&String> = members
         .iter()
-        .filter(|m| !ignore_crates.contains(m))
+        .filter(|m| !opts.ignore_crates.contains(m))
         .collect();
 
     let ci_content = std::fs::read_to_string(&full_ci_path)
         .with_context(|| format!("Failed to read {}", full_ci_path.display()))?;
 
-    let missing = find_missing_members(&active_members, &ci_content, test_patterns, gate_cfg);
+    let rel_ci = normalize_rel_path(root, &full_ci_path);
+    let mut diagnostics = Vec::new();
 
-    if !missing.is_empty() {
-        bail!(
-            "Workspace members whose tests CI never runs (in {}):\n  ❌ {}\n\
-             Ensure each crate is targeted with `-p <crate>`, `--manifest-path`, or `cargo warden gate`.",
-            ci_file.display(),
-            missing.join(", ")
-        );
+    let missing = find_missing_members(
+        &active_members,
+        &ci_content,
+        opts.test_patterns,
+        opts.gate_cfg,
+    );
+    for m in missing {
+        diagnostics.push(Diagnostic {
+            rule_id: "warden/ci-parity".to_string(),
+            check: "ci-parity".to_string(),
+            severity: Severity::Error,
+            message: format!(
+                "Workspace member `{m}` is missing from CI test runs in {}",
+                opts.ci_file.display()
+            ),
+            file: Some(rel_ci.clone()),
+            line: None,
+            column: None,
+            fingerprint: format!("ci-parity:missing:{m}"),
+            metric_value: None,
+            suppressed: false,
+            suppression_reason: None,
+        });
     }
 
-    // Optional fan-out check for Sonar / lcov
-    if !fanout_expected.is_empty() {
+    if !opts.fanout_expected.is_empty() {
         let fanout_loop: Vec<&str> = ci_content
             .lines()
             .filter_map(|line| {
@@ -184,26 +227,95 @@ pub fn check_ci_parity_with_gate(
             .flatten()
             .collect();
 
-        let mut missing_fanout = Vec::new();
-        for expected in fanout_expected {
+        for expected in opts.fanout_expected {
             if !fanout_loop.contains(&expected.as_str()) {
-                missing_fanout.push(expected.clone());
+                diagnostics.push(Diagnostic {
+                    rule_id: "warden/ci-parity".to_string(),
+                    check: "ci-parity".to_string(),
+                    severity: Severity::Error,
+                    message: format!(
+                        "Crate `{expected}` is missing from coverage report fan-out loop in {}",
+                        opts.ci_file.display()
+                    ),
+                    file: Some(rel_ci.clone()),
+                    line: None,
+                    column: None,
+                    fingerprint: format!("ci-parity:fanout:{expected}"),
+                    metric_value: None,
+                    suppressed: false,
+                    suppression_reason: None,
+                });
             }
-        }
-
-        if !missing_fanout.is_empty() {
-            bail!(
-                "Crates missing from coverage report fan-out loop in {}:\n  ❌ {}",
-                ci_file.display(),
-                missing_fanout.join(", ")
-            );
         }
     }
 
-    println!(
-        "[ci-parity] OK: all {} active workspace member(s) verified in {}",
-        active_members.len(),
-        ci_file.display()
-    );
+    if diagnostics.is_empty() && opts.emit_text {
+        println!(
+            "[ci-parity] OK: all {} active workspace member(s) verified in {}",
+            active_members.len(),
+            opts.ci_file.display()
+        );
+    }
+
+    Ok(diagnostics)
+}
+
+/// Verify workspace-to-CI parity, recognizing workflows that delegate testing to `cargo warden gate`.
+pub fn check_ci_parity_with_gate(
+    root: &Path,
+    ci_file: &Path,
+    test_patterns: &[String],
+    ignore_crates: &[String],
+    fanout_expected: &[String],
+    gate_cfg: Option<&GateConfig>,
+) -> Result<()> {
+    let diagnostics = collect_ci_parity(
+        root,
+        &CiParityOptions {
+            ci_file,
+            test_patterns,
+            ignore_crates,
+            fanout_expected,
+            gate_cfg,
+            changeset: None,
+            emit_text: true,
+        },
+    )?;
+
+    let missing: Vec<String> = diagnostics
+        .iter()
+        .filter(|d| !d.suppressed && d.fingerprint.starts_with("ci-parity:missing:"))
+        .filter_map(|d| {
+            d.fingerprint
+                .strip_prefix("ci-parity:missing:")
+                .map(str::to_string)
+        })
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "Workspace members whose tests CI never runs (in {}):\n  ❌ {}\n\
+             Ensure each crate is targeted with `-p <crate>`, `--manifest-path`, or `cargo warden gate`.",
+            ci_file.display(),
+            missing.join(", ")
+        );
+    }
+
+    let missing_fanout: Vec<String> = diagnostics
+        .iter()
+        .filter(|d| !d.suppressed && d.fingerprint.starts_with("ci-parity:fanout:"))
+        .filter_map(|d| {
+            d.fingerprint
+                .strip_prefix("ci-parity:fanout:")
+                .map(str::to_string)
+        })
+        .collect();
+    if !missing_fanout.is_empty() {
+        bail!(
+            "Crates missing from coverage report fan-out loop in {}:\n  ❌ {}",
+            ci_file.display(),
+            missing_fanout.join(", ")
+        );
+    }
+
     Ok(())
 }

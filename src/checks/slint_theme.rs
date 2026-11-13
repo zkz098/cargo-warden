@@ -5,10 +5,13 @@
 //! - `apply`: Rewrites hex literals into `Theme.c<hex>` and injects import statements.
 //! - `generate`: Emits `theme.slint` from a declarative color mapping.
 
+use crate::report::{Diagnostic, Severity, normalize_rel_path};
+use crate::suppression::FileSuppressions;
+use crate::walker::{WalkOptions, collect_files};
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -88,6 +91,110 @@ pub fn scan_unmapped(ui_dir: &Path, unchanged: &[String]) -> Result<BTreeMap<Str
     }
 
     Ok(unmapped)
+}
+
+/// Options for running the Slint theme check with `.gitignore`, changeset, and structured reporting.
+#[derive(Debug, Clone)]
+pub struct SlintThemeOptions<'a> {
+    pub base_dir: &'a Path,
+    pub unchanged: &'a [String],
+    pub respect_gitignore: bool,
+    pub changeset: Option<&'a BTreeSet<PathBuf>>,
+    pub emit_text: bool,
+}
+
+/// Collect structured Slint theme diagnostics (line-accurate + inline suppression aware).
+pub fn collect_theme(ui_dir: &Path, opts: &SlintThemeOptions<'_>) -> Result<Vec<Diagnostic>> {
+    if opts.emit_text {
+        println!(
+            "[slint-theme] scanning {} for unmapped hex literals...",
+            ui_dir.display()
+        );
+    }
+    tracing::debug!(
+        ui_dir = %ui_dir.display(),
+        unchanged_count = opts.unchanged.len(),
+        respect_gitignore = opts.respect_gitignore,
+        "scanning slint files for unmapped hex literals"
+    );
+
+    let slint_exts = vec!["slint".to_string()];
+    let ignore_theme = vec!["theme.slint".to_string()];
+    let slint_files = collect_files(
+        &[ui_dir.to_path_buf()],
+        &WalkOptions {
+            extensions: &slint_exts,
+            ignore_patterns: &ignore_theme,
+            respect_gitignore: opts.respect_gitignore,
+            base_dir: Some(opts.base_dir),
+            changeset: opts.changeset,
+        },
+    );
+
+    let unchanged_set: HashSet<String> = opts
+        .unchanged
+        .iter()
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+    let re = Regex::new(r"#([0-9a-fA-F]{3,8})\b")?;
+    let mut diagnostics = Vec::new();
+
+    for file in &slint_files {
+        let text = fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+        let rel = normalize_rel_path(opts.base_dir, file);
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        let suppressions = FileSuppressions::parse(&text);
+
+        for (idx, line) in text.lines().enumerate() {
+            let line_no = idx + 1;
+            for cap in re.captures_iter(line) {
+                let hex = cap[1].to_ascii_lowercase();
+                if (hex.len() == 6 || hex.len() == 8) && !unchanged_set.contains(&hex) {
+                    let suppressed = suppressions.is_suppressed("slint-theme", Some(line_no));
+                    diagnostics.push(Diagnostic {
+                        rule_id: "warden/slint-theme".to_string(),
+                        check: "slint-theme".to_string(),
+                        severity: Severity::Error,
+                        message: format!("Unmapped color #{hex} at {}:{}", rel.display(), line_no),
+                        file: Some(rel.clone()),
+                        line: Some(line_no),
+                        column: None,
+                        fingerprint: format!("slint-theme:{rel_str}:{hex}"),
+                        metric_value: None,
+                        suppressed,
+                        suppression_reason: suppressed.then(|| "inline".to_string()),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(diagnostics)
+}
+
+pub fn check_theme_with_options(ui_dir: &Path, opts: &SlintThemeOptions<'_>) -> Result<()> {
+    let diagnostics = collect_theme(ui_dir, opts)?;
+    let active: Vec<&Diagnostic> = diagnostics.iter().filter(|d| !d.suppressed).collect();
+    if active.is_empty() {
+        if opts.emit_text {
+            println!(
+                "[slint-theme] OK: all hex colors in {} are mapped or whitelisted",
+                ui_dir.display()
+            );
+        }
+        Ok(())
+    } else {
+        if opts.emit_text {
+            println!(
+                "[slint-theme] ❌ unmapped hex colors found ({}):",
+                active.len()
+            );
+            for d in &active {
+                println!("  {}", d.message);
+            }
+        }
+        bail!("Unmapped hex colors remain in .slint components");
+    }
 }
 
 /// Run the theme color check. Fails if any unmapped colors are found.

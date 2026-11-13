@@ -6,7 +6,11 @@
 //! - Boolean operator transitions (e.g. sequence of `&&` then `||`).
 //! - Labeled break/continue statements.
 
+use crate::report::{Diagnostic, Severity, normalize_rel_path};
+use crate::suppression::FileSuppressions;
+use crate::walker::{WalkOptions, collect_files};
 use anyhow::{Context, Result, bail};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use syn::visit::{self, Visit};
@@ -181,7 +185,19 @@ impl<'ast> Visit<'ast> for FileAstScanner {
     }
 }
 
-pub fn analyze_file(path: &Path) -> Result<Vec<ComplexityReport>> {
+/// Options for running the cognitive complexity check.
+#[derive(Debug, Clone)]
+pub struct ComplexityOptions<'a> {
+    pub base_dir: &'a Path,
+    pub max_complexity: usize,
+    pub ignore_tests: bool,
+    pub ignore_patterns: &'a [String],
+    pub respect_gitignore: bool,
+    pub changeset: Option<&'a BTreeSet<PathBuf>>,
+    pub emit_text: bool,
+}
+
+fn analyze_file_with_content(path: &Path) -> Result<(Vec<ComplexityReport>, FileSuppressions)> {
     tracing::debug!(path = %path.display(), "analyzing rust file for cognitive complexity");
     let content =
         fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
@@ -195,7 +211,110 @@ pub fn analyze_file(path: &Path) -> Result<Vec<ComplexityReport>> {
     };
     scanner.visit_file(&syntax);
 
-    Ok(scanner.reports)
+    let suppressions = FileSuppressions::parse(&content);
+    Ok((scanner.reports, suppressions))
+}
+
+pub fn analyze_file(path: &Path) -> Result<Vec<ComplexityReport>> {
+    Ok(analyze_file_with_content(path)?.0)
+}
+
+/// Collect complexity reports and structured diagnostics.
+pub fn collect_complexity(
+    paths: &[PathBuf],
+    opts: &ComplexityOptions<'_>,
+) -> Result<(Vec<ComplexityReport>, usize, Vec<Diagnostic>)> {
+    if opts.emit_text {
+        println!(
+            "[complexity] analyzing cognitive complexity (max allowed: {})...",
+            opts.max_complexity
+        );
+    }
+    tracing::debug!(
+        roots = ?paths,
+        max_complexity = opts.max_complexity,
+        ignore_tests = opts.ignore_tests,
+        respect_gitignore = opts.respect_gitignore,
+        ignore_patterns = ?opts.ignore_patterns,
+        "starting cognitive complexity check"
+    );
+
+    let rust_exts = vec!["rs".to_string()];
+    let files = collect_files(
+        paths,
+        &WalkOptions {
+            extensions: &rust_exts,
+            ignore_patterns: opts.ignore_patterns,
+            respect_gitignore: opts.respect_gitignore,
+            base_dir: Some(opts.base_dir),
+            changeset: opts.changeset,
+        },
+    );
+
+    let mut all_reports = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut files_scanned = 0;
+
+    for path in files {
+        let path_str = path.to_string_lossy().replace('\\', "/");
+        if opts.ignore_tests {
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if path_str.contains("/tests/")
+                || file_name.ends_with("_test.rs")
+                || file_name.ends_with("_tests.rs")
+                || file_name == "tests.rs"
+            {
+                tracing::trace!(file = %path.display(), "skipping test file");
+                continue;
+            }
+        }
+
+        match analyze_file_with_content(&path) {
+            Ok((file_reports, suppressions)) => {
+                tracing::trace!(
+                    file = %path.display(),
+                    functions = file_reports.len(),
+                    "analyzed file"
+                );
+                files_scanned += 1;
+                let rel = normalize_rel_path(opts.base_dir, &path);
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+
+                for report in &file_reports {
+                    if report.score > opts.max_complexity {
+                        let suppressed =
+                            suppressions.is_suppressed("complexity", Some(report.line));
+                        diagnostics.push(Diagnostic {
+                            rule_id: "warden/complexity".to_string(),
+                            check: "complexity".to_string(),
+                            severity: Severity::Error,
+                            message: format!(
+                                "{}:{} - `{}()` score: {} (> {})",
+                                rel.display(),
+                                report.line,
+                                report.function_name,
+                                report.score,
+                                opts.max_complexity
+                            ),
+                            file: Some(rel.clone()),
+                            line: Some(report.line),
+                            column: None,
+                            fingerprint: format!("complexity:{}:{}", rel_str, report.function_name),
+                            metric_value: Some(report.score),
+                            suppressed,
+                            suppression_reason: suppressed.then(|| "inline".to_string()),
+                        });
+                    }
+                }
+                all_reports.extend(file_reports);
+            }
+            Err(err) => {
+                tracing::warn!(file = %path.display(), error = %err, "failed to parse rust file; skipping");
+            }
+        }
+    }
+
+    Ok((all_reports, files_scanned, diagnostics))
 }
 
 pub fn check_complexity(
@@ -204,91 +323,47 @@ pub fn check_complexity(
     ignore_tests: bool,
     ignore_patterns: &[String],
 ) -> Result<Vec<ComplexityReport>> {
-    println!("[complexity] analyzing cognitive complexity (max allowed: {max_complexity})...");
-    tracing::debug!(
-        roots = ?paths,
-        max_complexity,
-        ignore_tests,
-        ignore_patterns = ?ignore_patterns,
-        "starting cognitive complexity check"
-    );
-    let mut all_reports = Vec::new();
-    let mut files_scanned = 0;
+    check_complexity_with_options(
+        paths,
+        &ComplexityOptions {
+            base_dir: Path::new("."),
+            max_complexity,
+            ignore_tests,
+            ignore_patterns,
+            respect_gitignore: true,
+            changeset: None,
+            emit_text: true,
+        },
+    )
+}
 
-    for root in paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(std::result::Result::ok)
-        {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("rs") {
-                continue;
-            }
+pub fn check_complexity_with_options(
+    paths: &[PathBuf],
+    opts: &ComplexityOptions<'_>,
+) -> Result<Vec<ComplexityReport>> {
+    let (all_reports, files_scanned, diagnostics) = collect_complexity(paths, opts)?;
+    let active: Vec<&Diagnostic> = diagnostics.iter().filter(|d| !d.suppressed).collect();
 
-            let path_str = path.to_string_lossy().replace('\\', "/");
-
-            if ignore_patterns.iter().any(|pat| path_str.contains(pat)) {
-                tracing::trace!(file = %path.display(), "skipping ignored path");
-                continue;
-            }
-
-            if ignore_tests {
-                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if path_str.contains("/tests/")
-                    || file_name.ends_with("_test.rs")
-                    || file_name.ends_with("_tests.rs")
-                    || file_name == "tests.rs"
-                {
-                    tracing::trace!(file = %path.display(), "skipping test file");
-                    continue;
-                }
-            }
-
-            match analyze_file(path) {
-                Ok(file_reports) => {
-                    tracing::trace!(
-                        file = %path.display(),
-                        functions = file_reports.len(),
-                        "analyzed file"
-                    );
-                    files_scanned += 1;
-                    all_reports.extend(file_reports);
-                }
-                Err(err) => {
-                    tracing::warn!(file = %path.display(), error = %err, "failed to parse rust file; skipping");
-                }
-            }
+    if active.is_empty() {
+        if opts.emit_text {
+            println!(
+                "[complexity] OK: scanned {} functions across {} files, all within limit ({})",
+                all_reports.len(),
+                files_scanned,
+                opts.max_complexity
+            );
         }
-    }
-
-    let violations: Vec<&ComplexityReport> = all_reports
-        .iter()
-        .filter(|r| r.score > max_complexity)
-        .collect();
-
-    if violations.is_empty() {
-        println!(
-            "[complexity] OK: scanned {} functions across {} files, all within limit ({})",
-            all_reports.len(),
-            files_scanned,
-            max_complexity
-        );
         Ok(all_reports)
     } else {
-        println!(
-            "[complexity] ❌ {} function(s) exceed maximum cognitive complexity (threshold: {}):",
-            violations.len(),
-            max_complexity
-        );
-        for v in &violations {
+        if opts.emit_text {
             println!(
-                "  ❌ {}:{} - `{}()` score: {} (> {})",
-                v.file.display(),
-                v.line,
-                v.function_name,
-                v.score,
-                max_complexity
+                "[complexity] ❌ {} function(s) exceed maximum cognitive complexity (threshold: {}):",
+                active.len(),
+                opts.max_complexity
             );
+            for d in &active {
+                println!("  ❌ {}", d.message);
+            }
         }
         bail!("Cognitive complexity threshold exceeded");
     }

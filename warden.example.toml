@@ -2,11 +2,26 @@
 # Place this file as `warden.toml` or `.warden.toml` in your project root,
 # or define it inside `Cargo.toml` under `[workspace.metadata.warden]`.
 
+# Optional baseline file for gradual adoption (capture via `cargo warden baseline generate`)
+# baseline = "warden-baseline.json"
+
 [dag]
 # Source roots to scan for modules
 roots = ["crates/my-core/src"]
 # Modules that must not be depended on by siblings (e.g. assembly/boot points)
 forbid_imports = ["bootstrap"]
+
+# Optional layered architecture rules
+# [[dag.layers]]
+# name = "domain"
+# modules = ["domain", "core::domain"]
+# allow = []
+#
+# [[dag.layers]]
+# name = "app"
+# modules = ["app"]
+# allow = ["domain", "infra"]
+# deny = ["bootstrap"]
 
 [ci_parity]
 # Path to CI workflow file relative to repository root
@@ -39,9 +54,11 @@ locales = ["en", "zh_CN"]
 max = 25
 # Directories to scan
 paths = ["crates", "src"]
-# Skip test files (*_test.rs, tests/, etc.)
+# Skip test files (*_test.rs, tests.rs, tests/ directory)
 ignore_tests = true
 ignore = ["target"]
+# Respect .gitignore rules (default: true)
+respect_gitignore = true
 
 [file_length]
 # Maximum allowed line count
@@ -50,6 +67,10 @@ max_lines = 800
 extensions = ["rs", "slint"]
 paths = ["crates", "src"]
 ignore = ["target", "tests", "lang"]
+# Counting mode: "physical" (all lines) or "effective" (SLOC, ignoring blanks and comments)
+mode = "physical"
+# Respect .gitignore rules (default: true)
+respect_gitignore = true
 
 [check]
 # Optional Cargo toolchain checks during `cargo warden check`

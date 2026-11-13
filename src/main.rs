@@ -1,212 +1,32 @@
+mod cli;
+
 use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::Parser;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use cargo_warden::config::WardenConfig;
-use cargo_warden::{checks, gate, hook};
+use cargo_warden::baseline::BaselineFile;
+use cargo_warden::config::{LineCountMode, WardenConfig};
+use cargo_warden::report::OutputFormat;
+use cargo_warden::{checks, gate, git, hook, init};
+use cli::{BaselineAction, Cli, Commands, HookAction, I18nAction, ThemeAction};
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "cargo-warden",
-    bin_name = "cargo warden",
-    version,
-    about = "Architecture boundaries, quality gates, cognitive complexity and drift prevention",
-    long_about = "A unified Cargo plugin and code quality toolkit for Rust and Slint projects."
-)]
-struct Cli {
-    /// Custom path to warden.toml configuration file
-    #[arg(long, global = true)]
-    config: Option<PathBuf>,
-
-    /// Working directory (defaults to current directory)
-    #[arg(short = 'C', long, global = true)]
-    cwd: Option<PathBuf>,
-
-    /// Increase logging verbosity (-v for info, -vv for debug, -vvv for trace)
-    #[arg(short = 'v', long, action = clap::ArgAction::Count, global = true)]
-    verbose: u8,
-
-    /// Suppress non-essential logging output
-    #[arg(short = 'q', long, global = true)]
-    quiet: bool,
-
-    #[command(subcommand)]
-    command: Commands,
+struct RuntimeContext {
+    format: OutputFormat,
+    changeset: Option<BTreeSet<PathBuf>>,
+    baseline_override: Option<PathBuf>,
+    no_baseline: bool,
 }
 
-#[derive(Subcommand, Debug)]
-enum Commands {
-    /// Verify module dependency boundaries and detect dependency cycles
-    Dag {
-        /// Source directory to inspect (e.g. `src` or `crates/core/src`)
-        #[arg(long)]
-        root: Option<PathBuf>,
-        /// Top-level modules that must not be imported
-        #[arg(long)]
-        forbid: Vec<String>,
-    },
-
-    /// Ensure all workspace members are covered in CI test runs
-    CiParity {
-        /// Path to the CI workflow file (default: `.github/workflows/ci.yml`)
-        #[arg(long)]
-        workflow: Option<PathBuf>,
-        /// Ignore specific workspace crates
-        #[arg(long)]
-        ignore: Vec<String>,
-    },
-
-    /// Slint UI theme color consistency tools
-    Theme {
-        #[command(subcommand)]
-        action: ThemeAction,
-    },
-
-    /// Gettext .po translation catalog tools
-    I18n {
-        #[command(subcommand)]
-        action: I18nAction,
-    },
-
-    /// Scan Rust functions for cognitive complexity violations
-    Complexity {
-        /// Maximum allowed cognitive complexity score per function
-        #[arg(long)]
-        max: Option<usize>,
-        /// Paths or files to inspect
-        #[arg(long)]
-        paths: Vec<PathBuf>,
-        /// Do not ignore test files
-        #[arg(long)]
-        no_ignore_tests: bool,
-    },
-
-    /// Check files against a maximum line count threshold
-    FileLength {
-        /// Maximum allowed line count per file
-        #[arg(long)]
-        max_lines: Option<usize>,
-        /// File extensions to check (e.g. `rs`, `slint`)
-        #[arg(long)]
-        ext: Vec<String>,
-        /// Paths to scan
-        #[arg(long)]
-        paths: Vec<PathBuf>,
-    },
-
-    /// Run the full local verification gate (static checks + fmt + clippy + test + doc)
-    Gate {
-        /// Run full whole-workspace checks (machete, deny, audit)
-        #[arg(long)]
-        full: bool,
-        /// Do not abort on first step failure
-        #[arg(long)]
-        keep_going: bool,
-        /// Skip static quality checks (`warden check`) before Cargo steps
-        #[arg(long)]
-        skip_checks: bool,
-        /// Run only the specified step(s) (comma-separated: checks,fmt,clippy,test,doc,machete,deny,audit)
-        #[arg(long, value_delimiter = ',')]
-        only: Vec<String>,
-        /// Skip the specified step(s) (comma-separated)
-        #[arg(long, value_delimiter = ',')]
-        skip: Vec<String>,
-    },
-
-    /// Run all configured static quality checks (and optional toolchain checks)
-    Check {
-        /// Also run fmt, clippy, and doc checks (skips test suite)
-        #[arg(long)]
-        full: bool,
-    },
-
-    /// Manage Git hooks (pre-commit / pre-push) for cargo-warden
-    Hook {
-        #[command(subcommand)]
-        action: HookAction,
-    },
-}
-
-#[derive(Copy, Clone, Debug, ValueEnum)]
-enum HookKindArg {
-    PreCommit,
-    PrePush,
-}
-
-impl From<HookKindArg> for hook::HookKind {
-    fn from(val: HookKindArg) -> Self {
-        match val {
-            HookKindArg::PreCommit => hook::HookKind::PreCommit,
-            HookKindArg::PrePush => hook::HookKind::PrePush,
+impl RuntimeContext {
+    fn static_opts(&self) -> checks::StaticRunOptions<'_> {
+        checks::StaticRunOptions {
+            changeset: self.changeset.as_ref(),
+            baseline_override: self.baseline_override.as_deref(),
+            no_baseline: self.no_baseline,
+            format: self.format,
         }
     }
-}
-
-#[derive(Subcommand, Debug)]
-enum HookAction {
-    /// Install or update a Git hook that runs cargo-warden
-    Install {
-        /// Git hook type to manage
-        #[arg(long, value_enum, default_value_t = HookKindArg::PreCommit)]
-        hook: HookKindArg,
-        /// Run `cargo warden gate` instead of `cargo warden check`
-        #[arg(long)]
-        gate: bool,
-        /// Run `cargo warden gate --full` (implies --gate)
-        #[arg(long)]
-        full: bool,
-        /// Overwrite an existing unmanaged hook file
-        #[arg(long)]
-        force: bool,
-        /// Append the cargo-warden block to an existing unmanaged hook file
-        #[arg(long, conflicts_with = "force")]
-        append: bool,
-    },
-    /// Remove the cargo-warden Git hook (or strip its managed block)
-    Uninstall {
-        /// Git hook type to remove
-        #[arg(long, value_enum, default_value_t = HookKindArg::PreCommit)]
-        hook: HookKindArg,
-    },
-    /// Show installation status of cargo-warden Git hooks
-    Status,
-}
-
-#[derive(Subcommand, Debug)]
-enum ThemeAction {
-    /// Scan for unmapped hardcoded hex literals in .slint files
-    Check {
-        #[arg(long)]
-        ui_dir: Option<PathBuf>,
-    },
-    /// Automatically rewrite hardcoded hex colors to Theme.c<hex>
-    Apply {
-        #[arg(long)]
-        ui_dir: Option<PathBuf>,
-    },
-    /// Generate theme.slint from definition
-    Generate {
-        #[arg(long)]
-        out_file: Option<PathBuf>,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum I18nAction {
-    /// Verify that the generated Rust catalog is in sync with .po files
-    Check {
-        #[arg(long)]
-        lang_dir: Option<PathBuf>,
-        #[arg(long)]
-        out_file: Option<PathBuf>,
-    },
-    /// Regenerate the Rust catalog lookup table from .po files
-    Generate {
-        #[arg(long)]
-        lang_dir: Option<PathBuf>,
-        #[arg(long)]
-        out_file: Option<PathBuf>,
-    },
 }
 
 fn init_tracing(verbose: u8, quiet: bool) {
@@ -271,28 +91,88 @@ fn main() -> Result<()> {
     };
     tracing::debug!(base_dir = %base_dir.display(), "base directory resolved");
 
+    let scope = if cli.staged {
+        git::ChangesetScope::Staged
+    } else if let Some(base) = cli.diff {
+        git::ChangesetScope::Diff(base)
+    } else {
+        git::ChangesetScope::All
+    };
+    let changeset = git::resolve_changeset(&base_dir, &scope)?;
+
+    let ctx = RuntimeContext {
+        format: cli.format.into(),
+        changeset,
+        baseline_override: cli.baseline,
+        no_baseline: cli.no_baseline,
+    };
+
+    if let Commands::Init {
+        force,
+        dotfile,
+        interactive,
+    } = cli.command
+    {
+        init::run_init(
+            &base_dir,
+            &init::InitOptions {
+                force,
+                dotfile,
+                interactive,
+            },
+        )?;
+        return Ok(());
+    }
+
     let config = load_config(cli.config.as_ref(), &base_dir)?;
-    dispatch_command(cli.command, config, &base_dir)
+    dispatch_command(cli.command, config, &base_dir, &ctx)
 }
 
-fn dispatch_command(command: Commands, config: WardenConfig, base_dir: &Path) -> Result<()> {
+fn dispatch_command(
+    command: Commands,
+    config: WardenConfig,
+    base_dir: &Path,
+    ctx: &RuntimeContext,
+) -> Result<()> {
     match command {
-        Commands::Dag { root, forbid } => handle_dag(config, base_dir, root, forbid),
+        Commands::Init { .. } => unreachable!("handled prior to config loading"),
+        Commands::Baseline { action } => handle_baseline(&config, base_dir, action, ctx),
+        Commands::Dag { root, forbid } => handle_dag(config, base_dir, root, forbid, ctx),
         Commands::CiParity { workflow, ignore } => {
-            handle_ci_parity(config, base_dir, workflow, ignore)
+            handle_ci_parity(config, base_dir, workflow, ignore, ctx)
         }
-        Commands::Theme { action } => handle_theme(config, base_dir, action),
-        Commands::I18n { action } => handle_i18n(config, base_dir, action),
+        Commands::Theme { action } => handle_theme(config, base_dir, action, ctx),
+        Commands::I18n { action } => handle_i18n(config, base_dir, action, ctx),
         Commands::Complexity {
             max,
             paths,
             no_ignore_tests,
-        } => handle_complexity(config, base_dir, max, paths, no_ignore_tests),
+            no_gitignore,
+        } => handle_complexity(
+            config,
+            base_dir,
+            max,
+            paths,
+            no_ignore_tests,
+            no_gitignore,
+            ctx,
+        ),
         Commands::FileLength {
             max_lines,
             ext,
             paths,
-        } => handle_file_length(config, base_dir, max_lines, ext, paths),
+            effective,
+            no_gitignore,
+        } => handle_file_length(
+            config,
+            base_dir,
+            max_lines,
+            ext,
+            paths,
+            effective,
+            no_gitignore,
+            ctx,
+        ),
         Commands::Gate {
             full,
             keep_going,
@@ -307,11 +187,106 @@ fn dispatch_command(command: Commands, config: WardenConfig, base_dir: &Path) ->
                 only,
                 skip,
             };
-            gate::runner::run_gate_with_checks(base_dir, &config, &opts)
+            gate::runner::run_gate_with_static_options(base_dir, &config, &opts, &ctx.static_opts())
         }
-        Commands::Check { full } => handle_check(&config, base_dir, full),
+        Commands::Check { full } => handle_check(&config, base_dir, full, ctx),
         Commands::Hook { action } => handle_hook(action, base_dir),
     }
+}
+
+fn handle_baseline(
+    config: &WardenConfig,
+    base_dir: &Path,
+    action: BaselineAction,
+    ctx: &RuntimeContext,
+) -> Result<()> {
+    match action {
+        BaselineAction::Generate { out } => {
+            let target = out
+                .map(|p| if p.is_absolute() { p } else { base_dir.join(p) })
+                .or_else(|| {
+                    checks::resolve_baseline_path(
+                        base_dir,
+                        config,
+                        ctx.baseline_override.as_deref(),
+                        false,
+                    )
+                })
+                .unwrap_or_else(|| base_dir.join("warden-baseline.json"));
+
+            let diags = checks::collect_all_static_checks(
+                config,
+                base_dir,
+                &checks::StaticRunOptions {
+                    changeset: None,
+                    baseline_override: None,
+                    no_baseline: true,
+                    format: OutputFormat::Sarif, // suppress per-check stdout chatter
+                },
+            )?;
+            let baseline = BaselineFile::from_diagnostics(&diags);
+            baseline.save(&target)?;
+            println!(
+                "✅ [baseline] captured {} violation(s) -> {}",
+                baseline.entries.len(),
+                target.display()
+            );
+            Ok(())
+        }
+        BaselineAction::Check { path } => {
+            let override_path = path
+                .as_deref()
+                .or(ctx.baseline_override.as_deref())
+                .or(config.baseline.as_deref())
+                .unwrap_or_else(|| Path::new("warden-baseline.json"));
+            let check_ctx = RuntimeContext {
+                format: ctx.format,
+                changeset: ctx.changeset.clone(),
+                baseline_override: Some(override_path.to_path_buf()),
+                no_baseline: false,
+            };
+            checks::run_static_checks_with_options(config, base_dir, &check_ctx.static_opts())
+        }
+    }
+}
+
+fn finish_single_check(
+    diagnostics: Vec<cargo_warden::report::Diagnostic>,
+    config: &WardenConfig,
+    base_dir: &Path,
+    ctx: &RuntimeContext,
+    failure_msg: &str,
+) -> Result<()> {
+    let (report, stats) = checks::apply_baseline_and_report(
+        diagnostics,
+        base_dir,
+        config,
+        ctx.baseline_override.as_deref(),
+        ctx.no_baseline,
+    )?;
+    if !ctx.format.is_structured() {
+        let inline_suppressed = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.suppressed && d.suppression_reason.as_deref() == Some("inline"))
+            .count();
+        if inline_suppressed > 0 || stats.suppressed > 0 {
+            println!(
+                "ℹ️  suppressed {} finding(s) (inline: {}, baseline: {})",
+                inline_suppressed + stats.suppressed,
+                inline_suppressed,
+                stats.suppressed
+            );
+        }
+        if report.passed {
+            return Ok(());
+        }
+        for d in report.diagnostics.iter().filter(|d| !d.suppressed) {
+            println!("  ❌ {}", d.message);
+        }
+        anyhow::bail!("{failure_msg}");
+    }
+    checks::emit_report_and_enforce(&report, stats, ctx.format, failure_msg)
 }
 
 fn handle_dag(
@@ -319,19 +294,52 @@ fn handle_dag(
     base_dir: &Path,
     root: Option<PathBuf>,
     forbid: Vec<String>,
+    ctx: &RuntimeContext,
 ) -> Result<()> {
-    let dag_cfg = config.dag.unwrap_or_default();
-    let roots = root.map_or(dag_cfg.roots, |r| vec![r]);
+    let dag_cfg = config.dag.clone().unwrap_or_default();
+    let roots = root.map_or_else(|| dag_cfg.roots.clone(), |r| vec![r]);
     let forbidden = if forbid.is_empty() {
-        dag_cfg.forbid_imports
+        dag_cfg.forbid_imports.clone()
     } else {
         forbid
     };
 
+    let emit_text = !ctx.format.is_structured();
+    let mut diagnostics = Vec::new();
     for r in roots {
-        checks::dag::check_dag(&base_dir.join(r), &forbidden)?;
+        let diags = checks::dag::collect_dag(
+            &base_dir.join(r),
+            &checks::dag::DagOptions {
+                base_dir,
+                forbid_imports: &forbidden,
+                layers: &dag_cfg.layers,
+                rules: &dag_cfg.rules,
+                changeset: ctx.changeset.as_ref(),
+                emit_text,
+            },
+        )?;
+        diagnostics.extend(diags);
     }
-    Ok(())
+
+    if emit_text && !diagnostics.iter().any(|d| !d.suppressed) {
+        println!("[dag] OK: dependencies form a clean DAG with 0 cycle(s)");
+    }
+
+    let failure_msg = if diagnostics
+        .iter()
+        .any(|d| !d.suppressed && d.rule_id == "warden/dag/cycle")
+    {
+        "Module dependency cycle(s) detected"
+    } else if diagnostics
+        .iter()
+        .any(|d| !d.suppressed && d.rule_id == "warden/dag/forbid-import")
+    {
+        "Forbidden imports detected (modules depending on assembly/forbidden targets)"
+    } else {
+        "Layered architecture boundary violation(s) detected"
+    };
+
+    finish_single_check(diagnostics, &config, base_dir, ctx, failure_msg)
 }
 
 fn handle_ci_parity(
@@ -339,31 +347,73 @@ fn handle_ci_parity(
     base_dir: &Path,
     workflow: Option<PathBuf>,
     ignore: Vec<String>,
+    ctx: &RuntimeContext,
 ) -> Result<()> {
-    let ci_cfg = config.ci_parity.unwrap_or_default();
-    let wf = workflow.unwrap_or(ci_cfg.workflow);
+    let ci_cfg = config.ci_parity.clone().unwrap_or_default();
+    let wf = workflow.unwrap_or_else(|| ci_cfg.workflow.clone());
     let ignored = if ignore.is_empty() {
-        ci_cfg.ignore_crates
+        ci_cfg.ignore_crates.clone()
     } else {
         ignore
     };
 
-    checks::ci_parity::check_ci_parity_with_gate(
+    let diagnostics = checks::ci_parity::collect_ci_parity(
         base_dir,
-        &wf,
-        &ci_cfg.test_patterns,
-        &ignored,
-        &ci_cfg.fanout_crates,
-        config.gate.as_ref(),
+        &checks::ci_parity::CiParityOptions {
+            ci_file: &wf,
+            test_patterns: &ci_cfg.test_patterns,
+            ignore_crates: &ignored,
+            fanout_expected: &ci_cfg.fanout_crates,
+            gate_cfg: config.gate.as_ref(),
+            changeset: ctx.changeset.as_ref(),
+            emit_text: !ctx.format.is_structured(),
+        },
+    )?;
+
+    finish_single_check(
+        diagnostics,
+        &config,
+        base_dir,
+        ctx,
+        "Workspace members missing from CI parity",
     )
 }
 
-fn handle_theme(config: WardenConfig, base_dir: &Path, action: ThemeAction) -> Result<()> {
-    let theme_cfg = config.slint_theme.unwrap_or_default();
+fn handle_theme(
+    config: WardenConfig,
+    base_dir: &Path,
+    action: ThemeAction,
+    ctx: &RuntimeContext,
+) -> Result<()> {
+    let theme_cfg = config.slint_theme.clone().unwrap_or_default();
     match action {
         ThemeAction::Check { ui_dir } => {
-            let dir = ui_dir.unwrap_or(theme_cfg.ui_dir);
-            checks::slint_theme::check_theme(&base_dir.join(dir), &theme_cfg.unchanged_colors)
+            let dir = ui_dir.unwrap_or_else(|| theme_cfg.ui_dir.clone());
+            let emit_text = !ctx.format.is_structured();
+            let full_dir = base_dir.join(&dir);
+            let diagnostics = checks::slint_theme::collect_theme(
+                &full_dir,
+                &checks::slint_theme::SlintThemeOptions {
+                    base_dir,
+                    unchanged: &theme_cfg.unchanged_colors,
+                    respect_gitignore: theme_cfg.respect_gitignore,
+                    changeset: ctx.changeset.as_ref(),
+                    emit_text,
+                },
+            )?;
+            if emit_text && !diagnostics.iter().any(|d| !d.suppressed) {
+                println!(
+                    "[slint-theme] OK: all hex colors in {} are mapped or whitelisted",
+                    full_dir.display()
+                );
+            }
+            finish_single_check(
+                diagnostics,
+                &config,
+                base_dir,
+                ctx,
+                "Unmapped hex colors remain in .slint components",
+            )
         }
         ThemeAction::Apply { ui_dir } => {
             let dir = ui_dir.unwrap_or(theme_cfg.ui_dir);
@@ -412,17 +462,32 @@ fn load_theme_token_mapping(
     mapping
 }
 
-fn handle_i18n(config: WardenConfig, base_dir: &Path, action: I18nAction) -> Result<()> {
-    let i18n_cfg = config.i18n.unwrap_or_default();
+fn handle_i18n(
+    config: WardenConfig,
+    base_dir: &Path,
+    action: I18nAction,
+    ctx: &RuntimeContext,
+) -> Result<()> {
+    let i18n_cfg = config.i18n.clone().unwrap_or_default();
     match action {
         I18nAction::Check { lang_dir, out_file } => {
-            let ldir = lang_dir.unwrap_or(i18n_cfg.lang_dir);
-            let ofile = out_file.unwrap_or(i18n_cfg.out_file);
-            checks::i18n_po::check_i18n(
-                &base_dir.join(ldir),
-                &i18n_cfg.domain,
-                &i18n_cfg.locales,
-                &base_dir.join(ofile),
+            let ldir = lang_dir.unwrap_or_else(|| i18n_cfg.lang_dir.clone());
+            let ofile = out_file.unwrap_or_else(|| i18n_cfg.out_file.clone());
+            let diagnostics = checks::i18n_po::collect_i18n(&checks::i18n_po::I18nOptions {
+                base_dir,
+                lang_dir: &base_dir.join(ldir),
+                domain: &i18n_cfg.domain,
+                locales: &i18n_cfg.locales,
+                out_file: &base_dir.join(ofile),
+                changeset: ctx.changeset.as_ref(),
+                emit_text: !ctx.format.is_structured(),
+            })?;
+            finish_single_check(
+                diagnostics,
+                &config,
+                base_dir,
+                ctx,
+                "Translation catalog is out of sync with .po catalogs",
             )
         }
         I18nAction::Generate { lang_dir, out_file } => {
@@ -444,8 +509,10 @@ fn handle_complexity(
     max: Option<usize>,
     paths: Vec<PathBuf>,
     no_ignore_tests: bool,
+    no_gitignore: bool,
+    ctx: &RuntimeContext,
 ) -> Result<()> {
-    let comp_cfg = config.complexity.unwrap_or_default();
+    let comp_cfg = config.complexity.clone().unwrap_or_default();
     let max_score = max.unwrap_or(comp_cfg.max);
     let raw_paths = if paths.is_empty() {
         &comp_cfg.paths
@@ -454,22 +521,55 @@ fn handle_complexity(
     };
     let search_paths = join_paths(base_dir, raw_paths);
     let ignore_tests = !no_ignore_tests && comp_cfg.ignore_tests;
+    let respect_gitignore = !no_gitignore && comp_cfg.respect_gitignore;
+    let emit_text = !ctx.format.is_structured();
 
-    checks::complexity::check_complexity(&search_paths, max_score, ignore_tests, &comp_cfg.ignore)?;
-    Ok(())
+    let (reports, files_scanned, diagnostics) = checks::complexity::collect_complexity(
+        &search_paths,
+        &checks::complexity::ComplexityOptions {
+            base_dir,
+            max_complexity: max_score,
+            ignore_tests,
+            ignore_patterns: &comp_cfg.ignore,
+            respect_gitignore,
+            changeset: ctx.changeset.as_ref(),
+            emit_text,
+        },
+    )?;
+
+    if emit_text && !diagnostics.iter().any(|d| !d.suppressed) {
+        println!(
+            "[complexity] OK: scanned {} functions across {} files, all within limit ({})",
+            reports.len(),
+            files_scanned,
+            max_score
+        );
+    }
+
+    finish_single_check(
+        diagnostics,
+        &config,
+        base_dir,
+        ctx,
+        "Cognitive complexity threshold exceeded",
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_file_length(
     config: WardenConfig,
     base_dir: &Path,
     max_lines: Option<usize>,
     ext: Vec<String>,
     paths: Vec<PathBuf>,
+    effective: bool,
+    no_gitignore: bool,
+    ctx: &RuntimeContext,
 ) -> Result<()> {
-    let fl_cfg = config.file_length.unwrap_or_default();
+    let fl_cfg = config.file_length.clone().unwrap_or_default();
     let limit = max_lines.unwrap_or(fl_cfg.max_lines);
     let extensions = if ext.is_empty() {
-        fl_cfg.extensions
+        fl_cfg.extensions.clone()
     } else {
         ext
     };
@@ -479,13 +579,57 @@ fn handle_file_length(
         &paths
     };
     let search_paths = join_paths(base_dir, raw_paths);
+    let mode = if effective {
+        LineCountMode::Effective
+    } else {
+        fl_cfg.mode
+    };
+    let respect_gitignore = !no_gitignore && fl_cfg.respect_gitignore;
+    let emit_text = !ctx.format.is_structured();
 
-    checks::file_length::check_file_length(&search_paths, limit, &extensions, &fl_cfg.ignore)?;
-    Ok(())
+    let (reports, diagnostics) = checks::file_length::collect_file_length(
+        &search_paths,
+        &checks::file_length::FileLengthOptions {
+            base_dir,
+            max_lines: limit,
+            extensions: &extensions,
+            ignore_patterns: &fl_cfg.ignore,
+            mode,
+            respect_gitignore,
+            changeset: ctx.changeset.as_ref(),
+            emit_text,
+        },
+    )?;
+
+    if emit_text && !diagnostics.iter().any(|d| !d.suppressed) {
+        let mode_label = match mode {
+            LineCountMode::Physical => "lines",
+            LineCountMode::Effective => "effective lines",
+        };
+        println!(
+            "[file-length] OK: scanned {} file(s), all within {} {}",
+            reports.len(),
+            limit,
+            mode_label
+        );
+    }
+
+    finish_single_check(
+        diagnostics,
+        &config,
+        base_dir,
+        ctx,
+        "Maximum file line count exceeded",
+    )
 }
 
-fn handle_check(config: &WardenConfig, base_dir: &Path, full: bool) -> Result<()> {
-    checks::run_static_checks(config, base_dir)?;
+fn handle_check(
+    config: &WardenConfig,
+    base_dir: &Path,
+    full: bool,
+    ctx: &RuntimeContext,
+) -> Result<()> {
+    checks::run_static_checks_with_options(config, base_dir, &ctx.static_opts())?;
     gate::runner::run_check_toolchain_steps(base_dir, config, full)
 }
 
@@ -493,11 +637,12 @@ fn handle_hook(action: HookAction, base_dir: &Path) -> Result<()> {
     match action {
         HookAction::Install {
             hook: kind,
+            staged,
             gate,
             full,
             force,
             append,
-        } => handle_hook_install(base_dir, kind.into(), gate, full, force, append),
+        } => handle_hook_install(base_dir, kind.into(), staged, gate, full, force, append),
         HookAction::Uninstall { hook: kind } => {
             match hook::uninstall_hook(base_dir, kind.into())? {
                 hook::UninstallOutcome::RemovedFile(path) => {
@@ -524,6 +669,7 @@ fn handle_hook(action: HookAction, base_dir: &Path) -> Result<()> {
 fn handle_hook_install(
     base_dir: &Path,
     kind: hook::HookKind,
+    staged: bool,
     gate: bool,
     full: bool,
     force: bool,
@@ -533,6 +679,8 @@ fn handle_hook_install(
         hook::HookMode::GateFull
     } else if gate {
         hook::HookMode::Gate
+    } else if staged {
+        hook::HookMode::CheckStaged
     } else {
         hook::HookMode::Check
     };

@@ -3,10 +3,11 @@
 //! Reconciles standard gettext `.po` catalogs across locales into a sorted,
 //! binary-searchable static Rust array of entries for zero-cost runtime lookup.
 
+use crate::report::{Diagnostic, Severity, normalize_rel_path};
 use anyhow::{Context, Result, bail};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Parse a `.po` catalog file into a map of `msgid -> msgstr`.
 pub fn parse_po(path: &Path) -> Result<BTreeMap<String, String>> {
@@ -184,40 +185,117 @@ fn normalize(text: &str) -> String {
     text.replace("\r\n", "\n")
 }
 
+/// Options for running i18n catalog sync checks.
+#[derive(Debug, Clone)]
+pub struct I18nOptions<'a> {
+    pub base_dir: &'a Path,
+    pub lang_dir: &'a Path,
+    pub domain: &'a str,
+    pub locales: &'a [String],
+    pub out_file: &'a Path,
+    pub changeset: Option<&'a BTreeSet<PathBuf>>,
+    pub emit_text: bool,
+}
+
+fn should_run_i18n_changeset(
+    base_dir: &Path,
+    lang_dir: &Path,
+    out_file: &Path,
+    changeset: &BTreeSet<PathBuf>,
+) -> bool {
+    let lang_rel = normalize_rel_path(base_dir, lang_dir)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let out_rel = normalize_rel_path(base_dir, out_file)
+        .to_string_lossy()
+        .replace('\\', "/");
+    changeset.iter().any(|p| {
+        let s = p.to_string_lossy().replace('\\', "/");
+        s == out_rel
+            || s == "warden.toml"
+            || s == ".warden.toml"
+            || s.starts_with(&format!("{lang_rel}/"))
+    })
+}
+
+/// Collect structured i18n synchronization diagnostics.
+pub fn collect_i18n(opts: &I18nOptions<'_>) -> Result<Vec<Diagnostic>> {
+    if let Some(changed) = opts.changeset
+        && !should_run_i18n_changeset(opts.base_dir, opts.lang_dir, opts.out_file, changed)
+    {
+        tracing::info!("skipping i18n check (no .po or catalog changes)");
+        return Ok(Vec::new());
+    }
+
+    tracing::debug!(
+        lang_dir = %opts.lang_dir.display(),
+        domain = opts.domain,
+        locales = ?opts.locales,
+        out_file = %opts.out_file.display(),
+        "checking i18n catalog synchronization"
+    );
+    if opts.emit_text {
+        println!(
+            "[i18n] checking catalog sync: {} against {}",
+            opts.lang_dir.display(),
+            opts.out_file.display()
+        );
+    }
+
+    let generated = generate_catalog(opts.lang_dir, opts.domain, opts.locales)?;
+    let on_disk = fs::read_to_string(opts.out_file)
+        .with_context(|| format!("Failed to read target catalog {}", opts.out_file.display()))?;
+
+    let rel_out = normalize_rel_path(opts.base_dir, opts.out_file);
+    let rel_str = rel_out.to_string_lossy().replace('\\', "/");
+
+    if normalize(&generated) == normalize(&on_disk) {
+        if opts.emit_text {
+            println!(
+                "[i18n] OK: {} is in sync with .po catalogs",
+                opts.out_file.display()
+            );
+        }
+        Ok(Vec::new())
+    } else {
+        Ok(vec![Diagnostic {
+            rule_id: "warden/i18n".to_string(),
+            check: "i18n".to_string(),
+            severity: Severity::Error,
+            message: format!(
+                "Translation catalog {} is out of sync with .po catalogs. Run `cargo warden i18n generate` to refresh.",
+                rel_out.display()
+            ),
+            file: Some(rel_out),
+            line: None,
+            column: None,
+            fingerprint: format!("i18n:sync:{rel_str}"),
+            metric_value: None,
+            suppressed: false,
+            suppression_reason: None,
+        }])
+    }
+}
+
 pub fn check_i18n(
     lang_dir: &Path,
     domain: &str,
     locales: &[String],
     out_file: &Path,
 ) -> Result<()> {
-    tracing::debug!(
-        lang_dir = %lang_dir.display(),
+    let diagnostics = collect_i18n(&I18nOptions {
+        base_dir: Path::new("."),
+        lang_dir,
         domain,
-        locales = ?locales,
-        out_file = %out_file.display(),
-        "checking i18n catalog synchronization"
-    );
-    println!(
-        "[i18n] checking catalog sync: {} against {}",
-        lang_dir.display(),
-        out_file.display()
-    );
-    let generated = generate_catalog(lang_dir, domain, locales)?;
-    let on_disk = fs::read_to_string(out_file)
-        .with_context(|| format!("Failed to read target catalog {}", out_file.display()))?;
-
-    if normalize(&generated) == normalize(&on_disk) {
-        println!(
-            "[i18n] OK: {} is in sync with .po catalogs",
-            out_file.display()
-        );
-        Ok(())
-    } else {
-        bail!(
-            "Translation catalog {} is out of sync with .po catalogs. Run `cargo warden i18n generate` to refresh.",
-            out_file.display()
-        )
+        locales,
+        out_file,
+        changeset: None,
+        emit_text: true,
+    })?;
+    if let Some(first) = diagnostics.iter().find(|d| !d.suppressed) {
+        bail!("{}", first.message);
     }
+    Ok(())
 }
 
 pub fn sync_i18n(lang_dir: &Path, domain: &str, locales: &[String], out_file: &Path) -> Result<()> {

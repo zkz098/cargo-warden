@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct WardenConfig {
+    /// Optional path to baseline JSON file (e.g. "warden-baseline.json")
+    pub baseline: Option<PathBuf>,
     pub dag: Option<DagConfig>,
     pub ci_parity: Option<CiParityConfig>,
     pub slint_theme: Option<SlintThemeConfig>,
@@ -34,6 +36,10 @@ pub struct DagConfig {
     pub roots: Vec<PathBuf>,
     /// Top-level modules that must never be imported by other sibling modules
     pub forbid_imports: Vec<String>,
+    /// Named architectural layers with allowed/denied dependency targets
+    pub layers: Vec<LayerConfig>,
+    /// Explicit module/layer dependency rules
+    pub rules: Vec<DagRuleConfig>,
 }
 
 impl Default for DagConfig {
@@ -41,8 +47,34 @@ impl Default for DagConfig {
         Self {
             roots: vec![PathBuf::from("src")],
             forbid_imports: Vec::new(),
+            layers: Vec::new(),
+            rules: Vec::new(),
         }
     }
+}
+
+/// Architectural layer definition for `dag` boundary enforcement.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct LayerConfig {
+    pub name: String,
+    /// Module names or `parent::child` paths belonging to this layer (defaults to `[name]`)
+    pub modules: Vec<String>,
+    /// Allowed target layers or modules (if `Some`, any other cross-layer dependency is denied)
+    pub allow: Option<Vec<String>>,
+    /// Explicitly forbidden target layers or modules
+    pub deny: Vec<String>,
+}
+
+/// Direct dependency boundary rule between modules or layers.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DagRuleConfig {
+    pub from: String,
+    /// Allowed target modules or layers (if `Some`, all other targets are denied)
+    pub allow_only: Option<Vec<String>>,
+    /// Forbidden target modules or layers
+    pub deny: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +112,9 @@ pub struct SlintThemeConfig {
     pub unchanged_colors: Vec<String>,
     /// Theme color mapping source file (optional TOML with dark->light and accents)
     pub theme_def: Option<PathBuf>,
+    /// Respect `.gitignore` rules while scanning UI directory
+    #[serde(default = "default_true")]
+    pub respect_gitignore: bool,
 }
 
 impl Default for SlintThemeConfig {
@@ -93,6 +128,7 @@ impl Default for SlintThemeConfig {
                 "6b7280".to_string(),
             ],
             theme_def: None,
+            respect_gitignore: true,
         }
     }
 }
@@ -130,8 +166,11 @@ pub struct ComplexityConfig {
     pub paths: Vec<PathBuf>,
     /// Exclude test files (*_test.rs, tests.rs, tests/ directory)
     pub ignore_tests: bool,
-    /// File patterns or paths to ignore
+    /// File patterns or paths to ignore (supports glob patterns)
     pub ignore: Vec<String>,
+    /// Respect `.gitignore` rules while scanning
+    #[serde(default = "default_true")]
+    pub respect_gitignore: bool,
 }
 
 impl Default for ComplexityConfig {
@@ -141,8 +180,20 @@ impl Default for ComplexityConfig {
             paths: vec![PathBuf::from(".")],
             ignore_tests: true,
             ignore: vec!["target".to_string()],
+            respect_gitignore: true,
         }
     }
+}
+
+/// Line counting mode for `file_length`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LineCountMode {
+    /// Count all physical lines (`content.lines().count()`).
+    #[default]
+    Physical,
+    /// Count only effective code lines (SLOC), excluding blank lines and comments.
+    Effective,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,8 +205,13 @@ pub struct FileLengthConfig {
     pub extensions: Vec<String>,
     /// Roots/paths to scan
     pub paths: Vec<PathBuf>,
-    /// Ignore patterns
+    /// Ignore patterns (supports glob patterns)
     pub ignore: Vec<String>,
+    /// Line counting mode (`physical` or `effective`)
+    pub mode: LineCountMode,
+    /// Respect `.gitignore` rules while scanning
+    #[serde(default = "default_true")]
+    pub respect_gitignore: bool,
 }
 
 impl Default for FileLengthConfig {
@@ -165,6 +221,8 @@ impl Default for FileLengthConfig {
             extensions: vec!["rs".to_string(), "slint".to_string()],
             paths: vec![PathBuf::from(".")],
             ignore: vec!["target".to_string(), "tests".to_string()],
+            mode: LineCountMode::Physical,
+            respect_gitignore: true,
         }
     }
 }

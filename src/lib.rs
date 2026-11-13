@@ -1,4 +1,10 @@
+pub mod baseline;
 pub mod checks;
 pub mod config;
 pub mod gate;
+pub mod git;
 pub mod hook;
+pub mod init;
+pub mod report;
+pub mod suppression;
+pub mod walker;

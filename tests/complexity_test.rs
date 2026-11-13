@@ -1,4 +1,6 @@
-use cargo_warden::checks::complexity::{analyze_file, check_complexity};
+use cargo_warden::checks::complexity::{
+    ComplexityOptions, analyze_file, check_complexity, collect_complexity,
+};
 use std::fs;
 use tempfile::tempdir;
 
@@ -221,4 +223,42 @@ fn test_ignore_tests_and_ignore_patterns() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn test_inline_complexity_suppression_across_attribute() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("legacy.rs"),
+        r#"
+// warden:allow(complexity: legacy state machine)
+#[inline]
+pub fn legacy_fn(x: i32) {
+    if x > 0 {
+        if x > 1 {
+            if x > 2 {}
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let (_reports, _files, diagnostics) = collect_complexity(
+        &[dir.path().to_path_buf()],
+        &ComplexityOptions {
+            base_dir: dir.path(),
+            max_complexity: 2,
+            ignore_tests: true,
+            ignore_patterns: &[],
+            respect_gitignore: true,
+            changeset: None,
+            emit_text: false,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(diagnostics.len(), 1);
+    assert!(diagnostics[0].suppressed);
+    assert_eq!(diagnostics[0].suppression_reason.as_deref(), Some("inline"));
 }

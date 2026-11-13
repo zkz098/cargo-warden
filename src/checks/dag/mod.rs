@@ -3,9 +3,15 @@
 //! Validates module dependencies inside a crate source root:
 //! 1. Builds the module dependency graph at top-level module granularity using `syn` AST.
 //! 2. Detects module dependency cycles using Tarjan's SCC algorithm.
-//! 3. Enforces forbidden import targets (e.g. assembly/bootstrap modules that must not be depended upon).
+//! 3. Enforces forbidden import targets and layered architecture boundary rules.
 
+mod layers;
+
+use crate::config::{DagRuleConfig, LayerConfig};
+use crate::report::{Diagnostic, Severity, normalize_rel_path};
+use crate::suppression::FileSuppressions;
 use anyhow::{Result, bail};
+use layers::{check_edge_forbid, check_edge_layers, check_edge_rules};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -150,9 +156,15 @@ fn expand_syn_use_tree(tree: &UseTree, base: &[String], out: &mut Vec<Vec<String
     }
 }
 
+#[derive(Debug, Clone)]
+struct ImportRef {
+    tokens: Vec<String>,
+    line: usize,
+}
+
 #[derive(Default)]
 struct ImportVisitor {
-    paths: Vec<Vec<String>>,
+    paths: Vec<ImportRef>,
 }
 
 impl<'ast> Visit<'ast> for ImportVisitor {
@@ -164,7 +176,12 @@ impl<'ast> Visit<'ast> for ImportVisitor {
     }
 
     fn visit_item_use(&mut self, item: &'ast ItemUse) {
-        expand_syn_use_tree(&item.tree, &[], &mut self.paths);
+        let line = item.use_token.span.start().line;
+        let mut expanded = Vec::new();
+        expand_syn_use_tree(&item.tree, &[], &mut expanded);
+        for tokens in expanded {
+            self.paths.push(ImportRef { tokens, line });
+        }
         visit::visit_item_use(self, item);
     }
 
@@ -174,7 +191,8 @@ impl<'ast> Visit<'ast> for ImportVisitor {
             if ident_str == "crate" || ident_str == "super" || ident_str == "self" {
                 let tokens: Vec<String> =
                     path.segments.iter().map(|s| ident_name(&s.ident)).collect();
-                self.paths.push(tokens);
+                let line = first.ident.span().start().line;
+                self.paths.push(ImportRef { tokens, line });
             }
         }
         visit::visit_path(self, path);
@@ -208,61 +226,12 @@ fn resolve_tokens(tokens: &[String], current: &[String]) -> Option<Vec<String>> 
     }
 }
 
-fn top_level(module: &[String]) -> Option<&str> {
+pub(super) fn top_level(module: &[String]) -> Option<&str> {
     module.first().map(String::as_str)
 }
 
 pub fn module_graph(src_root: &Path) -> (BTreeSet<String>, BTreeMap<String, BTreeSet<String>>) {
-    let mut files = Vec::new();
-    collect_source_files(src_root, &[], &mut files);
-
-    let nodes: BTreeSet<String> = files
-        .iter()
-        .filter_map(|file| top_level(&file.module).map(str::to_string))
-        .collect();
-    let module_names = nodes.clone();
-
-    let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for file in &files {
-        let Some(from) = top_level(&file.module) else {
-            continue;
-        };
-        let Ok(raw) = std::fs::read_to_string(&file.path) else {
-            continue;
-        };
-        let syntax = match syn::parse_file(&raw) {
-            Ok(s) => s,
-            Err(err) => {
-                eprintln!(
-                    "[dag] warning: skipping {} due to parse error: {err}",
-                    file.path.display()
-                );
-                continue;
-            }
-        };
-        if has_test_attr(&syntax.attrs) {
-            continue;
-        }
-
-        let mut visitor = ImportVisitor::default();
-        visitor.visit_file(&syntax);
-
-        for path in visitor.paths {
-            let Some(resolved) = resolve_tokens(&path, &file.module) else {
-                continue;
-            };
-            let Some(to) = top_level(&resolved) else {
-                continue;
-            };
-            if to == from || !module_names.contains(to) {
-                continue;
-            }
-            edges
-                .entry(from.to_string())
-                .or_default()
-                .insert(to.to_string());
-        }
-    }
+    let (nodes, edges, _) = collect_detailed_edges(src_root);
     (nodes, edges)
 }
 
@@ -337,51 +306,273 @@ pub fn find_cycles(
     state.found
 }
 
-pub fn check_dag(src_root: &Path, forbid_imports: &[String]) -> Result<()> {
+/// Options for running the DAG and layered architecture check.
+#[derive(Debug, Clone)]
+pub struct DagOptions<'a> {
+    pub base_dir: &'a Path,
+    pub forbid_imports: &'a [String],
+    pub layers: &'a [LayerConfig],
+    pub rules: &'a [DagRuleConfig],
+    pub changeset: Option<&'a BTreeSet<PathBuf>>,
+    pub emit_text: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DetailedEdge {
+    pub(super) from_mod: Vec<String>,
+    pub(super) to_mod: Vec<String>,
+    pub(super) file: PathBuf,
+    pub(super) line: usize,
+    pub(super) suppressed: bool,
+}
+
+fn collect_detailed_edges(
+    src_root: &Path,
+) -> (
+    BTreeSet<String>,
+    BTreeMap<String, BTreeSet<String>>,
+    Vec<DetailedEdge>,
+) {
+    let mut files = Vec::new();
+    collect_source_files(src_root, &[], &mut files);
+
+    let nodes: BTreeSet<String> = files
+        .iter()
+        .filter_map(|file| top_level(&file.module).map(str::to_string))
+        .collect();
+    let module_names = nodes.clone();
+
+    let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut detailed = Vec::new();
+
+    for file in &files {
+        let Some(from_top) = top_level(&file.module) else {
+            continue;
+        };
+        let Ok(raw) = std::fs::read_to_string(&file.path) else {
+            continue;
+        };
+        let syntax = match syn::parse_file(&raw) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!(
+                    "[dag] warning: skipping {} due to parse error: {err}",
+                    file.path.display()
+                );
+                continue;
+            }
+        };
+        if has_test_attr(&syntax.attrs) {
+            continue;
+        }
+
+        let suppressions = FileSuppressions::parse(&raw);
+        let mut visitor = ImportVisitor::default();
+        visitor.visit_file(&syntax);
+
+        for import_ref in visitor.paths {
+            let Some(resolved) = resolve_tokens(&import_ref.tokens, &file.module) else {
+                continue;
+            };
+            let Some(to_top) = top_level(&resolved) else {
+                continue;
+            };
+            if !module_names.contains(to_top) {
+                continue;
+            }
+
+            let suppressed = suppressions.is_suppressed("dag", Some(import_ref.line));
+            if to_top != from_top && !suppressed {
+                edges
+                    .entry(from_top.to_string())
+                    .or_default()
+                    .insert(to_top.to_string());
+            }
+
+            if resolved != file.module {
+                detailed.push(DetailedEdge {
+                    from_mod: file.module.clone(),
+                    to_mod: resolved,
+                    file: file.path.clone(),
+                    line: import_ref.line,
+                    suppressed,
+                });
+            }
+        }
+    }
+
+    (nodes, edges, detailed)
+}
+
+fn root_has_changed_rs(src_root: &Path, base_dir: &Path, changeset: &BTreeSet<PathBuf>) -> bool {
+    let rel_root = normalize_rel_path(base_dir, src_root);
+    let root_prefix = rel_root.to_string_lossy().replace('\\', "/");
+    changeset.iter().any(|p| {
+        if p.extension().and_then(OsStr::to_str) != Some("rs") {
+            return false;
+        }
+        let s = p.to_string_lossy().replace('\\', "/");
+        root_prefix.is_empty()
+            || root_prefix == "."
+            || s == root_prefix
+            || s.starts_with(&format!("{root_prefix}/"))
+    })
+}
+
+/// Collect structured DAG diagnostics (cycles, forbidden imports, and layer/rule violations).
+pub fn collect_dag(src_root: &Path, opts: &DagOptions<'_>) -> Result<Vec<Diagnostic>> {
     if !src_root.exists() {
         bail!("Source root does not exist: {}", src_root.display());
     }
+
+    if let Some(changed) = opts.changeset
+        && !root_has_changed_rs(src_root, opts.base_dir, changed)
+    {
+        tracing::info!(
+            src_root = %src_root.display(),
+            "skipping DAG check (no changed Rust files under root)"
+        );
+        return Ok(Vec::new());
+    }
+
     tracing::debug!(
         src_root = %src_root.display(),
-        forbid_imports = ?forbid_imports,
+        forbid_imports = ?opts.forbid_imports,
+        layers = opts.layers.len(),
+        rules = opts.rules.len(),
         "starting module dependency DAG analysis"
     );
-    let (nodes, edges) = module_graph(src_root);
-    tracing::trace!(
-        nodes_count = nodes.len(),
-        edges_count = edges.len(),
-        "module dependency graph constructed"
-    );
-    println!(
-        "[dag] scanned {} top-level module(s) under {}",
-        nodes.len(),
-        src_root.display()
-    );
 
-    let cycles = find_cycles(&nodes, &edges);
-    tracing::trace!(cycles_count = cycles.len(), "cycle detection finished");
+    let (nodes, edges, detailed_edges) = collect_detailed_edges(src_root);
+    if opts.emit_text {
+        println!(
+            "[dag] scanned {} top-level module(s) under {}",
+            nodes.len(),
+            src_root.display()
+        );
+    }
+
+    let rel_root = normalize_rel_path(opts.base_dir, src_root);
+    let root_key = rel_root.to_string_lossy().replace('\\', "/");
+    let mut diagnostics = Vec::new();
+
+    for c in find_cycles(&nodes, &edges) {
+        let joined = c.join(" <-> ");
+        diagnostics.push(Diagnostic {
+            rule_id: "warden/dag/cycle".to_string(),
+            check: "dag".to_string(),
+            severity: Severity::Error,
+            message: format!(
+                "Module dependency cycle detected in {}: {}",
+                rel_root.display(),
+                joined
+            ),
+            file: Some(rel_root.clone()),
+            line: None,
+            column: None,
+            fingerprint: format!("dag:cycle:{root_key}:{}", c.join(",")),
+            metric_value: None,
+            suppressed: false,
+            suppression_reason: None,
+        });
+    }
+
+    let mut seen = BTreeSet::new();
+    for edge in &detailed_edges {
+        let rel_file = normalize_rel_path(opts.base_dir, &edge.file);
+        let rel_file_str = rel_file.to_string_lossy().replace('\\', "/");
+        check_edge_forbid(
+            edge,
+            opts,
+            &root_key,
+            &rel_file,
+            &rel_file_str,
+            &mut seen,
+            &mut diagnostics,
+        );
+        check_edge_layers(
+            edge,
+            opts,
+            &root_key,
+            &rel_file,
+            &rel_file_str,
+            &mut seen,
+            &mut diagnostics,
+        );
+        check_edge_rules(
+            edge,
+            opts,
+            &root_key,
+            &rel_file,
+            &rel_file_str,
+            &mut seen,
+            &mut diagnostics,
+        );
+    }
+
+    Ok(diagnostics)
+}
+
+pub fn check_dag(src_root: &Path, forbid_imports: &[String]) -> Result<()> {
+    check_dag_with_options(
+        src_root,
+        &DagOptions {
+            base_dir: Path::new("."),
+            forbid_imports,
+            layers: &[],
+            rules: &[],
+            changeset: None,
+            emit_text: true,
+        },
+    )
+}
+
+pub fn check_dag_with_options(src_root: &Path, opts: &DagOptions<'_>) -> Result<()> {
+    let diagnostics = collect_dag(src_root, opts)?;
+    let active: Vec<&Diagnostic> = diagnostics.iter().filter(|d| !d.suppressed).collect();
+
+    if active.is_empty() {
+        if opts.emit_text {
+            println!("[dag] OK: dependencies form a clean DAG with 0 cycle(s)");
+        }
+        return Ok(());
+    }
+
+    let cycles: Vec<&Diagnostic> = active
+        .iter()
+        .copied()
+        .filter(|d| d.rule_id == "warden/dag/cycle")
+        .collect();
     if !cycles.is_empty() {
         let mut msg = String::from("Module dependency cycle(s) detected:\n");
         for c in &cycles {
-            msg.push_str(&format!("  ❌ {}\n", c.join(" <-> ")));
+            msg.push_str(&format!("  ❌ {}\n", c.message));
         }
         bail!("{msg}");
     }
 
-    let forbidden_violations: Vec<String> = edges
+    let forbidden: Vec<&Diagnostic> = active
         .iter()
-        .flat_map(|(from, targets)| targets.iter().map(move |to| (from, to)))
-        .filter(|(from, to)| forbid_imports.contains(to) && !forbid_imports.contains(from))
-        .map(|(from, to)| format!("  ❌ {from} -> {to}"))
+        .copied()
+        .filter(|d| d.rule_id == "warden/dag/forbid-import")
         .collect();
-
-    if !forbidden_violations.is_empty() {
+    if !forbidden.is_empty() {
+        let lines: Vec<String> = forbidden
+            .iter()
+            .map(|d| format!("  ❌ {}", d.message))
+            .collect();
         bail!(
             "Forbidden imports detected (modules depending on assembly/forbidden targets):\n{}",
-            forbidden_violations.join("\n")
+            lines.join("\n")
         );
     }
 
-    println!("[dag] OK: dependencies form a clean DAG with 0 cycle(s)");
-    Ok(())
+    let layer_violations: Vec<String> = active
+        .iter()
+        .map(|d| format!("  ❌ {}", d.message))
+        .collect();
+    bail!(
+        "Layered architecture boundary violation(s) detected:\n{}",
+        layer_violations.join("\n")
+    );
 }

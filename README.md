@@ -10,15 +10,16 @@ A unified Cargo plugin and code quality toolkit for Rust and Slint projects.
 
 | Module | Command | Description |
 | :--- | :--- | :--- |
-| **Module Dependency DAG Guard** | `cargo warden dag` | Parses Rust module imports via `syn`, detects cycles using Tarjan's SCC algorithm, and enforces forbidden module boundaries (e.g., `bootstrap`). |
+| **Module Dependency DAG Guard** | `cargo warden dag` | Parses Rust module imports via `syn`, detects cycles using Tarjan's SCC algorithm, and enforces forbidden imports & layered architecture rules (`[[dag.layers]]` / `[[dag.rules]]`). |
 | **Workspace & CI Parity Check** | `cargo warden ci-parity` | Compares `cargo metadata` workspace members against CI workflow test lines to catch untested or stale crates. |
 | **Slint Theme Color Guard** | `cargo warden theme [check\|apply\|generate]` | Detects raw `#hex` color literals in `.slint` files, rewrites them to `Theme.c<hex>` with imports, and generates `theme.slint` from TOML. |
 | **Slint & Rust i18n Catalog Sync** | `cargo warden i18n [check\|generate]` | Parses gettext `.po` catalogs, generates a sorted Rust static lookup table, and verifies catalog synchronization. |
 | **Cognitive Complexity Checker** | `cargo warden complexity` | Measures function cognitive complexity via `syn` (control-flow nesting and boolean operator transitions) and reports threshold violations. |
-| **File Length Guard** | `cargo warden file-length` | Enforces maximum physical line counts across configured file extensions and paths to prevent god files. |
+| **File Length Guard** | `cargo warden file-length` | Enforces physical or effective code line (SLOC) thresholds across configured paths while honoring `.gitignore` and glob ignore patterns. |
+| **Project Init & Baseline** | `cargo warden init` / `baseline` | Auto-detects project layout to generate `warden.toml`, and manages baseline snapshots & `// warden:allow(...)` suppressions. |
 | **Local CI Verification Gate** | `cargo warden gate` | Mirrors CI pipelines locally (`fmt`, `clippy`, `nextest`/`test`, `doc`, plus optional `machete`, `deny`, and `audit`) with Cargo env scrubbing. |
-| **Unified Static Check** | `cargo warden check` | Runs all configured static checks in milliseconds—ideal for pre-commit hooks and CI. |
-| **Git Hook Management** | `cargo warden hook [install\|uninstall\|status]` | Installs, updates, inspects, and safely uninstalls `pre-commit` / `pre-push` hooks while preserving existing custom scripts. |
+| **Unified Static Check** | `cargo warden check` | Runs all configured static checks in milliseconds—supports `--staged`, `--diff <base>`, and `--format text\|json\|sarif`. |
+| **Git Hook Management** | `cargo warden hook [install\|uninstall\|status]` | Installs, updates, inspects, and safely uninstalls `pre-commit` / `pre-push` hooks (including `--staged` mode) while preserving existing custom scripts. |
 
 ---
 
@@ -110,9 +111,32 @@ Example output:
 
 ```bash
 cargo warden file-length --max-lines 800 --ext rs --ext slint --paths src/
+
+# Count effective code lines (SLOC), excluding blank lines and comments
+cargo warden file-length --effective --max-lines 500 --paths src/
 ```
 
-### 7. Unified Static Check & Local Gate (`check` / `gate`)
+### 7. Project Init, Baseline & Incremental / Structured Checks
+
+```bash
+# Auto-detect project layout and generate warden.toml (use -i for interactive prompts)
+cargo warden init
+
+# Capture current violations into warden-baseline.json (regressions still fail)
+cargo warden baseline generate
+
+# Incremental checks on staged changes or diff against a Git ref
+cargo warden check --staged
+cargo warden check --diff origin/main
+
+# Emit JSON or SARIF 2.1.0 diagnostics
+cargo warden check --format json
+cargo warden check --format sarif
+```
+
+Inline suppressions are also supported via comments: `// warden:allow(complexity)`, `// warden:allow(dag)`, `// warden:allow(slint-theme)`, and `// warden:allow-file(file-length)`.
+
+### 8. Unified Static Check & Local Gate (`check` / `gate`)
 
 ```bash
 # Run all static checks enabled in warden.toml / Cargo.toml metadata
@@ -132,11 +156,12 @@ cargo warden gate --skip test
 cargo warden gate --full
 ```
 
-### 8. Git Hook Management (`hook`)
+### 9. Git Hook Management (`hook`)
 
 ```bash
-# Install a pre-commit hook running `cargo warden check`
+# Install a pre-commit hook running `cargo warden check` (or `--staged` for incremental checks)
 cargo warden hook install
+cargo warden hook install --staged
 
 # Install a pre-push hook running `cargo warden gate`
 cargo warden hook install --hook pre-push --gate
