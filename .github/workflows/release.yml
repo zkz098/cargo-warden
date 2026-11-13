@@ -1,0 +1,159 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify Tag & Quality Gate
+    runs-on: ubuntu-latest
+    outputs:
+      prerelease: ${{ steps.tag-check.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches Cargo.toml version
+        id: tag-check
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "cargo-warden") | .version')"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VERSION) does not match Cargo.toml version ($PKG_VERSION)"
+            exit 1
+          fi
+          if [[ "$TAG_VERSION" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build cargo-warden
+        run: cargo build --locked
+
+      - name: Run full cargo-warden gate
+        run: ./target/debug/cargo-warden gate
+
+      - name: Dry-run cargo publish
+        run: cargo publish --dry-run --locked
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            ext: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            ext: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: ".exe"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package release archive
+        id: package
+        shell: bash
+        run: |
+          BIN_NAME="cargo-warden${{ matrix.ext }}"
+          ARCHIVE_DIR="cargo-warden-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "$ARCHIVE_DIR"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "$ARCHIVE_DIR/"
+          cp README.md LICENSE "$ARCHIVE_DIR/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a -tzip "${ARCHIVE_DIR}.zip" "$ARCHIVE_DIR"
+            echo "archive=${ARCHIVE_DIR}.zip" >> "$GITHUB_OUTPUT"
+          else
+            tar -czf "${ARCHIVE_DIR}.tar.gz" "$ARCHIVE_DIR"
+            echo "archive=${ARCHIVE_DIR}.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  github-release:
+    name: Create GitHub Release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true
+          prerelease: ${{ needs.verify.outputs.prerelease }}
+
+  publish-crates-io:
+    name: Publish to crates.io (OIDC)
+    needs: [verify, build, github-release]
+    runs-on: ubuntu-latest
+    # Note: Must match the "Environment name" configured in crates.io Trusted Publishing settings.
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Authenticate with crates.io via OIDC
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish crate to crates.io
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
