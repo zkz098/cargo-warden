@@ -10,6 +10,7 @@ pub struct WardenConfig {
     pub baseline: Option<PathBuf>,
     pub dag: Option<DagConfig>,
     pub ci_parity: Option<CiParityConfig>,
+    pub actions: Option<ActionsConfig>,
     pub slint_theme: Option<SlintThemeConfig>,
     pub i18n: Option<I18nConfig>,
     pub complexity: Option<ComplexityConfig>,
@@ -174,6 +175,31 @@ impl Default for CiParityConfig {
             test_patterns: vec!["nextest".to_string(), "llvm-cov".to_string()],
             ignore_crates: Vec::new(),
             fanout_crates: Vec::new(),
+        }
+    }
+}
+
+/// Configuration for GitHub Actions `uses:` version update checks (`[actions]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ActionsConfig {
+    /// Workflow files or directories to scan (default: `[".github/workflows"]`)
+    pub workflows: Vec<PathBuf>,
+    /// Action repositories or `owner/*` patterns to ignore
+    pub ignore: Vec<String>,
+    /// Emit errors instead of warnings when outdated actions are found (default: false)
+    pub strict: bool,
+    /// Include GitHub Actions update check in `cargo warden check` (default: false)
+    pub enabled_in_check: bool,
+}
+
+impl Default for ActionsConfig {
+    fn default() -> Self {
+        Self {
+            workflows: vec![PathBuf::from(".github/workflows")],
+            ignore: Vec::new(),
+            strict: false,
+            enabled_in_check: false,
         }
     }
 }

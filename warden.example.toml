@@ -50,6 +50,16 @@ ignore_crates = ["fuzz"]
 # Optional crates expected in coverage fan-out loops
 fanout_crates = []
 
+# [actions]
+# Workflow files or directories to scan (default: [".github/workflows"])
+# workflows = [".github/workflows"]
+# Action repositories or `owner/*` patterns to ignore
+# ignore = ["dtolnay/rust-toolchain"]
+# Fail with errors instead of warnings when outdated actions are found (default: false)
+# strict = false
+# Include GitHub Actions update check in `cargo warden check` (default: false)
+# enabled_in_check = false
+
 [slint_theme]
 # Directory containing .slint files
 ui_dir = "crates/my-app/ui"

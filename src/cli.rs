@@ -121,6 +121,22 @@ pub enum Commands {
         ignore: Vec<String>,
     },
 
+    /// Check GitHub Actions workflows for outdated `uses:` action references
+    Actions {
+        /// Workflow file(s) or directories to scan (default: `.github/workflows`)
+        #[arg(long)]
+        workflow: Vec<PathBuf>,
+        /// Ignore specific actions (e.g. `actions/checkout` or `owner/*`)
+        #[arg(long)]
+        ignore: Vec<String>,
+        /// Fail with non-zero exit code when outdated actions are found
+        #[arg(long)]
+        strict: bool,
+        /// Only scan local workflow files without querying remote GitHub repositories
+        #[arg(long)]
+        offline: bool,
+    },
+
     /// Slint UI theme color consistency tools
     Theme {
         #[command(subcommand)]

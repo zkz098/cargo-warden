@@ -12,8 +12,9 @@ use cargo_warden::config::WardenConfig;
 use cargo_warden::{doctor, gate, git, init};
 use cli::{Cli, Commands};
 use commands::{
-    RuntimeContext, handle_baseline, handle_check, handle_ci_parity, handle_complexity, handle_dag,
-    handle_file_length, handle_hook, handle_i18n, handle_theme, resolve_parallel_override,
+    RuntimeContext, handle_actions, handle_baseline, handle_check, handle_ci_parity,
+    handle_complexity, handle_dag, handle_file_length, handle_hook, handle_i18n, handle_theme,
+    resolve_parallel_override,
 };
 
 fn init_tracing(verbose: u8, quiet: bool) {
@@ -140,6 +141,12 @@ fn dispatch_command(
         Commands::CiParity { workflow, ignore } => {
             handle_ci_parity(config, base_dir, workflow, ignore, ctx)
         }
+        Commands::Actions {
+            workflow,
+            ignore,
+            strict,
+            offline,
+        } => handle_actions(config, base_dir, workflow, ignore, strict, offline, ctx),
         Commands::Theme { action } => handle_theme(config, base_dir, action, ctx),
         Commands::I18n { action } => handle_i18n(config, base_dir, action, ctx),
         Commands::Complexity {

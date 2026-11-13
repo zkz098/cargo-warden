@@ -1,3 +1,4 @@
+pub mod actions;
 mod ast_pipeline;
 pub mod ci_parity;
 pub mod complexity;
@@ -230,6 +231,38 @@ fn run_ci_parity_task(
     }))
 }
 
+fn run_actions_task(
+    config: &WardenConfig,
+    base_dir: &Path,
+    opts: &StaticRunOptions<'_>,
+) -> Result<Option<CheckTaskOutcome>> {
+    let Some(actions_cfg) = &config.actions else {
+        return Ok(None);
+    };
+    if !actions_cfg.enabled_in_check {
+        return Ok(None);
+    }
+    let diags = actions::collect_actions(
+        base_dir,
+        &actions::ActionsOptions {
+            workflows: &actions_cfg.workflows,
+            ignore: &actions_cfg.ignore,
+            strict: actions_cfg.strict,
+            offline: false,
+            changeset: opts.changeset,
+            emit_text: false,
+            parallel: opts.parallel,
+        },
+    )?;
+    let ok_line = diags
+        .is_empty()
+        .then(|| "[actions] OK: all GitHub Actions references are up to date".to_string());
+    Ok(Some(CheckTaskOutcome {
+        diagnostics: diags,
+        ok_line,
+    }))
+}
+
 fn run_slint_theme_task(
     config: &WardenConfig,
     base_dir: &Path,
@@ -334,10 +367,11 @@ pub fn collect_all_static_checks(
     let emit_text = !opts.format.is_structured();
     let ast_plans = ast_pipeline::build_plans(config, base_dir, opts)?;
 
-    let (fl_res, ci_res, theme_res, ws_dag_res, ast_results) = if opts.parallel {
+    let (fl_res, ci_res, actions_res, theme_res, ws_dag_res, ast_results) = if opts.parallel {
         tracing::debug!("running static quality checks with shared AST and file-level parallelism");
         std::thread::scope(|s| {
             let ci_handle = s.spawn(|| run_ci_parity_task(config, base_dir, opts));
+            let actions_handle = s.spawn(|| run_actions_task(config, base_dir, opts));
             let fl_handle = s.spawn(|| run_file_length_task(config, base_dir, opts, true));
             let theme_handle = s.spawn(|| run_slint_theme_task(config, base_dir, opts, true));
             let ws_dag_handle = s.spawn(|| run_workspace_dag_task(config, base_dir, opts));
@@ -353,6 +387,7 @@ pub fn collect_all_static_checks(
             (
                 join_task(fl_handle),
                 join_task(ci_handle),
+                join_task(actions_handle),
                 join_task(theme_handle),
                 join_task(ws_dag_handle),
                 ast_results,
@@ -363,9 +398,17 @@ pub fn collect_all_static_checks(
         let fl_res = run_file_length_task(config, base_dir, opts, false);
         let ast_results = ast_pipeline::run_shared_ast_tasks(&ast_plans, false);
         let ci_res = run_ci_parity_task(config, base_dir, opts);
+        let actions_res = run_actions_task(config, base_dir, opts);
         let theme_res = run_slint_theme_task(config, base_dir, opts, false);
         let ws_dag_res = run_workspace_dag_task(config, base_dir, opts);
-        (fl_res, ci_res, theme_res, ws_dag_res, ast_results)
+        (
+            fl_res,
+            ci_res,
+            actions_res,
+            theme_res,
+            ws_dag_res,
+            ast_results,
+        )
     };
 
     let comp_outcome = ast_pipeline::finish_complexity_outcome(
@@ -397,6 +440,7 @@ pub fn collect_all_static_checks(
         dag_outcome,
         ws_dag_res?,
         ci_res?,
+        actions_res?,
         theme_res?,
         i18n_outcome,
     ];

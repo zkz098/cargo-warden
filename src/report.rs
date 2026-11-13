@@ -249,6 +249,8 @@ fn rule_short_description(rule_id: &str) -> &'static str {
         "warden/nesting-depth" => "Function control-flow nesting depth exceeds threshold",
         "warden/file-length" => "File line count exceeds threshold",
         "warden/ci-parity" => "Workspace crate missing from CI test coverage",
+        "warden/actions/outdated" => "GitHub Action reference has a newer version available",
+        "warden/actions/fetch-failed" => "Failed to query remote tags for GitHub Action",
         "warden/slint-theme" => "Unmapped hardcoded hex color in Slint UI file",
         "warden/slint/spacing" => "Hardcoded spacing or padding length in Slint UI file",
         "warden/slint/radius" => "Hardcoded border radius or width in Slint UI file",

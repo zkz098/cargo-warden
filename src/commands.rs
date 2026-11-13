@@ -361,6 +361,34 @@ pub(crate) fn handle_ci_parity(
     )
 }
 
+pub(crate) fn handle_actions(
+    config: WardenConfig,
+    base_dir: &Path,
+    workflow: Vec<PathBuf>,
+    ignore: Vec<String>,
+    strict: bool,
+    offline: bool,
+    ctx: &RuntimeContext,
+) -> Result<()> {
+    let diagnostics = checks::actions::collect_actions_from_config(
+        &config,
+        base_dir,
+        &workflow,
+        &ignore,
+        strict,
+        offline,
+        ctx.changeset.as_ref(),
+        !ctx.format.is_structured(),
+    )?;
+    finish_single_check(
+        diagnostics,
+        &config,
+        base_dir,
+        ctx,
+        "Outdated GitHub Actions references found",
+    )
+}
+
 pub(crate) fn handle_theme(
     config: WardenConfig,
     base_dir: &Path,
