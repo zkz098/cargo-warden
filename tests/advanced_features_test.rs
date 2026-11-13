@@ -439,3 +439,136 @@ fn test_cli_file_length_effective_and_no_gitignore() {
         .unwrap();
     assert!(!no_git.status.success());
 }
+
+#[test]
+fn test_check_parallel_flags_and_static_fix_mode() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("ui")).unwrap();
+    fs::create_dir_all(dir.path().join("locales/zh_CN/LC_MESSAGES")).unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+
+    fs::write(
+        dir.path().join("src/main.rs"),
+        "fn main() { println!(\"{}\", tr(\"Hello\")); }\nfn tr(s: &str) -> &str { s }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("ui/app.slint"),
+        "export component App { Rectangle { background: #112233; } }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("locales/zh_CN/LC_MESSAGES/app.po"),
+        "msgid \"\"\nmsgstr \"\"\n\nmsgid \"Hello\"\nmsgstr \"你好\"\n",
+    )
+    .unwrap();
+
+    fs::write(
+        dir.path().join("warden.toml"),
+        r##"[check]
+fmt = false
+clippy = false
+doc = false
+
+[file_length]
+max_lines = 50
+ext = ["rs", "slint"]
+paths = ["src", "ui"]
+
+[slint_theme]
+ui_dir = "ui"
+
+[i18n]
+lang_dir = "locales"
+out_file = "src/catalog.rs"
+domain = "app"
+locales = ["zh_CN"]
+"##,
+    )
+    .unwrap();
+
+    // Without --fix, check fails in both parallel and sequential modes
+    let seq_fail = Command::new(warden_bin())
+        .args(["-C", dir.path().to_str().unwrap(), "check", "--no-parallel"])
+        .output()
+        .unwrap();
+    assert!(!seq_fail.status.success());
+
+    let par_fail = Command::new(warden_bin())
+        .args(["-C", dir.path().to_str().unwrap(), "check", "--parallel"])
+        .output()
+        .unwrap();
+    assert!(!par_fail.status.success());
+
+    // `check --fix` replaces raw #hex with `Theme.c<hex>` and generates `src/catalog.rs`
+    let fix_out = Command::new(warden_bin())
+        .args(["-C", dir.path().to_str().unwrap(), "check", "--fix"])
+        .output()
+        .unwrap();
+    assert!(
+        fix_out.status.success(),
+        "check --fix failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&fix_out.stdout),
+        String::from_utf8_lossy(&fix_out.stderr)
+    );
+
+    let updated_slint = fs::read_to_string(dir.path().join("ui/app.slint")).unwrap();
+    assert!(updated_slint.contains("Theme.c112233"), "{updated_slint}");
+    let generated_catalog = fs::read_to_string(dir.path().join("src/catalog.rs")).unwrap();
+    assert!(generated_catalog.contains("你好"), "{generated_catalog}");
+}
+
+#[test]
+fn test_gate_custom_step_and_fix_cli_end_to_end() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("warden.toml"),
+        r#"
+[gate]
+include_checks = false
+parallel = true
+
+[[gate.custom_steps]]
+name = "marker-step"
+program = "cargo"
+args = ["nonexistent-check-subcommand-xyz"]
+fix_args = ["--version"]
+read_only = true
+"#,
+    )
+    .unwrap();
+
+    // Non-fix mode runs `args` and fails
+    let fail_out = Command::new(warden_bin())
+        .args([
+            "-C",
+            dir.path().to_str().unwrap(),
+            "gate",
+            "--skip-checks",
+            "--only",
+            "marker-step",
+        ])
+        .output()
+        .unwrap();
+    assert!(!fail_out.status.success());
+
+    // `--fix` mode uses `fix_args` (`cargo --version`) and succeeds
+    let fix_out = Command::new(warden_bin())
+        .args([
+            "-C",
+            dir.path().to_str().unwrap(),
+            "gate",
+            "--skip-checks",
+            "--fix",
+            "--only",
+            "marker-step",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        fix_out.status.success(),
+        "gate --fix failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&fix_out.stdout),
+        String::from_utf8_lossy(&fix_out.stderr)
+    );
+}

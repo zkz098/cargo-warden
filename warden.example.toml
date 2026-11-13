@@ -77,10 +77,14 @@ respect_gitignore = true
 fmt = true
 clippy = false
 doc = false
+# Run independent static checks in parallel (default: true)
+parallel = true
 
 [gate]
 # Run configured static checks before Cargo steps (default: true)
 include_checks = true
+# Run consecutive read-only steps (fmt, machete, deny, audit, read_only custom steps) in parallel (default: true)
+parallel = true
 # Pinned toolchain for fmt parity with CI (optional)
 # rustfmt_toolchain = "1.85.0"
 
@@ -93,3 +97,20 @@ features = []
 name = "app"
 packages = ["my-app"]
 features = []
+
+# Optional custom gate steps (with optional read_only parallelism and --fix overrides)
+# [[gate.custom_steps]]
+# name = "license-header"
+# program = "cargo"
+# args = ["about", "check"]
+# cargo_tool = "about"        # optional `cargo <tool> --version` check before running
+# read_only = true            # eligible for parallel execution with adjacent read-only steps
+# full_only = false           # set true to run only with `cargo warden gate --full`
+# fix_args = ["about", "generate"]
+#
+# [[gate.custom_steps]]
+# name = "schema-lint"
+# command = "npm run lint:schema"
+# fix_command = "npm run lint:schema -- --fix"
+# cwd = "web"
+# env = { NODE_ENV = "test" }

@@ -222,6 +222,27 @@ pub fn check_theme(ui_dir: &Path, unchanged: &[String]) -> Result<()> {
     }
 }
 
+/// Load a hex-to-token mapping (`hex -> Theme.c<hex>`) from an optional theme definition TOML file.
+pub fn load_token_mapping(base_dir: &Path, theme_def: Option<&Path>) -> BTreeMap<String, String> {
+    let mut mapping = BTreeMap::new();
+    let Some(def_path) = theme_def else {
+        return mapping;
+    };
+    let Ok(content) = fs::read_to_string(base_dir.join(def_path)) else {
+        return mapping;
+    };
+    let Ok(def) = toml::from_str::<ThemeDefinition>(&content) else {
+        return mapping;
+    };
+    for (k, _) in def.static_map {
+        mapping.insert(k.to_ascii_lowercase(), format!("Theme.c{k}"));
+    }
+    for a in def.accent_map {
+        mapping.insert(a.key.to_ascii_lowercase(), format!("Theme.c{}", a.key));
+    }
+    mapping
+}
+
 /// Apply tokens across `.slint` files in `ui_dir`.
 pub fn apply_tokens(
     ui_dir: &Path,

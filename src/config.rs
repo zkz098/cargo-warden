@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -18,7 +19,7 @@ pub struct WardenConfig {
 }
 
 /// Optional Cargo toolchain checks integrated into `cargo warden check`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CheckConfig {
     /// Run `cargo fmt --all -- --check` during `cargo warden check`
@@ -27,6 +28,20 @@ pub struct CheckConfig {
     pub clippy: bool,
     /// Run `cargo doc` during `cargo warden check`
     pub doc: bool,
+    /// Run independent read-only static checks in parallel (default: true)
+    #[serde(default = "default_true")]
+    pub parallel: bool,
+}
+
+impl Default for CheckConfig {
+    fn default() -> Self {
+        Self {
+            fmt: false,
+            clippy: false,
+            doc: false,
+            parallel: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,6 +252,9 @@ pub struct GateConfig {
     /// Run configured static quality checks (`warden check`) before Cargo steps (default: true)
     #[serde(default = "default_true")]
     pub include_checks: bool,
+    /// Run independent read-only steps in parallel (default: true)
+    #[serde(default = "default_true")]
+    pub parallel: bool,
     /// Groups of packages to test
     pub test_groups: Vec<TestGroupConfig>,
     /// Pinned rustfmt version (optional)
@@ -249,20 +267,52 @@ pub struct GateConfig {
     pub rustdocflags: Option<String>,
     /// Step names to skip by default (e.g. `["audit"]`)
     pub skip_steps: Vec<String>,
+    /// User-defined custom steps executed during `cargo warden gate`
+    pub custom_steps: Vec<CustomStepConfig>,
 }
 
 impl Default for GateConfig {
     fn default() -> Self {
         Self {
             include_checks: true,
+            parallel: true,
             test_groups: Vec::new(),
             rustfmt_toolchain: None,
             clippy_args: Vec::new(),
             doc_args: Vec::new(),
             rustdocflags: None,
             skip_steps: Vec::new(),
+            custom_steps: Vec::new(),
         }
     }
+}
+
+/// User-defined custom command step executed by `cargo warden gate`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CustomStepConfig {
+    /// Step name (usable in `--only`, `--skip`, and `skip_steps`)
+    pub name: String,
+    /// Executable program name or path (optional if `command` is provided)
+    pub program: String,
+    /// Arguments passed to `program`
+    pub args: Vec<String>,
+    /// Shell/command string shorthand (used when `program` is empty)
+    pub command: Option<String>,
+    /// Optional cargo subcommand tool name to check via `cargo <tool> --version` before running
+    pub cargo_tool: Option<String>,
+    /// Environment variables set for this step
+    pub env: BTreeMap<String, String>,
+    /// Working directory relative to repository root
+    pub cwd: Option<PathBuf>,
+    /// Run only when `--full` is passed to `cargo warden gate`
+    pub full_only: bool,
+    /// Mark step as read-only so consecutive read-only steps can run in parallel
+    pub read_only: bool,
+    /// Replacement arguments passed to `program` when `--fix` is active
+    pub fix_args: Option<Vec<String>>,
+    /// Replacement command string used when `--fix` is active
+    pub fix_command: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

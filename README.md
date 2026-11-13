@@ -139,20 +139,31 @@ Inline suppressions are also supported via comments: `// warden:allow(complexity
 ### 8. Unified Static Check & Local Gate (`check` / `gate`)
 
 ```bash
-# Run all static checks enabled in warden.toml / Cargo.toml metadata
+# Run all static checks enabled in warden.toml / Cargo.toml metadata (parallel by default)
 cargo warden check
+cargo warden check --no-parallel
+
+# Auto-fix fixable issues (Slint theme tokens/files, i18n catalog sync, clippy --fix, cargo fmt)
+cargo warden check --fix
 
 # Also run fmt, clippy, and doc checks (without running the test suite)
 cargo warden check --full
 
-# Run unified verification pipeline (static checks + fmt + clippy + test/nextest + doc)
+# Run unified verification pipeline (static checks + fmt + clippy + test/nextest + doc + custom steps)
 cargo warden gate
 
-# Filter or skip specific gate steps
+# Auto-fix before running remaining gate checks (runs clippy --fix, cargo fmt, custom fix overrides)
+cargo warden gate --fix
+
+# Control parallel execution of consecutive read-only steps (fmt, machete, deny, audit, read_only custom steps)
+cargo warden gate --parallel
+cargo warden gate --no-parallel
+
+# Filter or skip specific gate steps (including custom step names)
 cargo warden gate --only fmt,clippy,doc
 cargo warden gate --skip test
 
-# Include cargo-machete, cargo-deny, and cargo-audit
+# Include cargo-machete, cargo-deny, and cargo-audit (plus full_only custom steps)
 cargo warden gate --full
 ```
 
@@ -220,15 +231,25 @@ ignore = ["target", "tests"]
 fmt = true
 clippy = false
 doc = false
+parallel = true
 
 [gate]
 include_checks = true
+parallel = true
 # rustfmt_toolchain = "1.85.0"
 
 [[gate.test_groups]]
 name = "core"
 packages = ["my-types", "my-core"]
 features = []
+
+# Optional custom gate steps
+# [[gate.custom_steps]]
+# name = "license-header"
+# command = "cargo about check"
+# cargo_tool = "about"
+# read_only = true
+# fix_command = "cargo about generate"
 ```
 
 ---

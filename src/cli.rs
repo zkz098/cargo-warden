@@ -174,7 +174,16 @@ pub enum Commands {
         /// Skip static quality checks (`warden check`) before Cargo steps
         #[arg(long)]
         skip_checks: bool,
-        /// Run only the specified step(s) (comma-separated: checks,fmt,clippy,test,doc,machete,deny,audit)
+        /// Automatically apply safe fixes (slint theme, i18n sync, clippy --fix, cargo fmt, custom fix steps)
+        #[arg(long)]
+        fix: bool,
+        /// Run independent read-only steps in parallel
+        #[arg(long, conflicts_with = "no_parallel")]
+        parallel: bool,
+        /// Force sequential execution of all checks and gate steps
+        #[arg(long, conflicts_with = "parallel")]
+        no_parallel: bool,
+        /// Run only the specified step(s) (comma-separated: checks,fmt,clippy,test,doc,machete,deny,audit, or custom step names)
         #[arg(long, value_delimiter = ',')]
         only: Vec<String>,
         /// Skip the specified step(s) (comma-separated)
@@ -187,6 +196,15 @@ pub enum Commands {
         /// Also run fmt, clippy, and doc checks (skips test suite)
         #[arg(long)]
         full: bool,
+        /// Automatically apply safe fixes (slint theme, i18n sync, clippy --fix, cargo fmt)
+        #[arg(long)]
+        fix: bool,
+        /// Run independent read-only static checks in parallel
+        #[arg(long, conflicts_with = "no_parallel")]
+        parallel: bool,
+        /// Force sequential execution of static checks
+        #[arg(long, conflicts_with = "parallel")]
+        no_parallel: bool,
     },
 
     /// Manage Git hooks (pre-commit / pre-push) for cargo-warden

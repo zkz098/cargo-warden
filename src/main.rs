@@ -19,13 +19,24 @@ struct RuntimeContext {
 }
 
 impl RuntimeContext {
-    fn static_opts(&self) -> checks::StaticRunOptions<'_> {
+    fn static_opts(&self, parallel: bool) -> checks::StaticRunOptions<'_> {
         checks::StaticRunOptions {
             changeset: self.changeset.as_ref(),
             baseline_override: self.baseline_override.as_deref(),
             no_baseline: self.no_baseline,
             format: self.format,
+            parallel,
         }
+    }
+}
+
+fn resolve_parallel_override(parallel: bool, no_parallel: bool) -> Option<bool> {
+    if parallel {
+        Some(true)
+    } else if no_parallel {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -177,19 +188,37 @@ fn dispatch_command(
             full,
             keep_going,
             skip_checks,
+            fix,
+            parallel,
+            no_parallel,
             only,
             skip,
         } => {
+            let parallel_override = resolve_parallel_override(parallel, no_parallel);
+            let static_parallel = parallel_override
+                .unwrap_or_else(|| config.gate.as_ref().is_none_or(|g| g.parallel));
             let opts = gate::runner::GateRunOptions {
                 full,
                 keep_going,
                 skip_checks,
+                fix,
+                parallel: parallel_override,
                 only,
                 skip,
             };
-            gate::runner::run_gate_with_static_options(base_dir, &config, &opts, &ctx.static_opts())
+            gate::runner::run_gate_with_static_options(
+                base_dir,
+                &config,
+                &opts,
+                &ctx.static_opts(static_parallel),
+            )
         }
-        Commands::Check { full } => handle_check(&config, base_dir, full, ctx),
+        Commands::Check {
+            full,
+            fix,
+            parallel,
+            no_parallel,
+        } => handle_check(&config, base_dir, full, fix, parallel, no_parallel, ctx),
         Commands::Hook { action } => handle_hook(action, base_dir),
     }
 }
@@ -222,6 +251,7 @@ fn handle_baseline(
                     baseline_override: None,
                     no_baseline: true,
                     format: OutputFormat::Sarif, // suppress per-check stdout chatter
+                    parallel: true,
                 },
             )?;
             let baseline = BaselineFile::from_diagnostics(&diags);
@@ -245,7 +275,12 @@ fn handle_baseline(
                 baseline_override: Some(override_path.to_path_buf()),
                 no_baseline: false,
             };
-            checks::run_static_checks_with_options(config, base_dir, &check_ctx.static_opts())
+            let static_parallel = config.check.as_ref().is_none_or(|c| c.parallel);
+            checks::run_static_checks_with_options(
+                config,
+                base_dir,
+                &check_ctx.static_opts(static_parallel),
+            )
         }
     }
 }
@@ -417,7 +452,8 @@ fn handle_theme(
         }
         ThemeAction::Apply { ui_dir } => {
             let dir = ui_dir.unwrap_or(theme_cfg.ui_dir);
-            let mapping = load_theme_token_mapping(base_dir, theme_cfg.theme_def.as_deref());
+            let mapping =
+                checks::slint_theme::load_token_mapping(base_dir, theme_cfg.theme_def.as_deref());
             checks::slint_theme::apply_tokens(
                 &base_dir.join(dir),
                 &mapping,
@@ -436,30 +472,6 @@ fn handle_theme(
             checks::slint_theme::generate_theme(&def, &base_dir.join(out))
         }
     }
-}
-
-fn load_theme_token_mapping(
-    base_dir: &Path,
-    theme_def: Option<&Path>,
-) -> std::collections::BTreeMap<String, String> {
-    let mut mapping = std::collections::BTreeMap::new();
-    let Some(def_path) = theme_def else {
-        return mapping;
-    };
-    let Ok(content) = std::fs::read_to_string(base_dir.join(def_path)) else {
-        return mapping;
-    };
-    let Ok(def) = toml::from_str::<checks::slint_theme::ThemeDefinition>(&content) else {
-        return mapping;
-    };
-
-    for (k, _) in def.static_map {
-        mapping.insert(k.to_ascii_lowercase(), format!("Theme.c{k}"));
-    }
-    for a in def.accent_map {
-        mapping.insert(a.key.to_ascii_lowercase(), format!("Theme.c{}", a.key));
-    }
-    mapping
 }
 
 fn handle_i18n(
@@ -627,10 +639,39 @@ fn handle_check(
     config: &WardenConfig,
     base_dir: &Path,
     full: bool,
+    fix: bool,
+    parallel: bool,
+    no_parallel: bool,
     ctx: &RuntimeContext,
 ) -> Result<()> {
-    checks::run_static_checks_with_options(config, base_dir, &ctx.static_opts())?;
-    gate::runner::run_check_toolchain_steps(base_dir, config, full)
+    let parallel_override = resolve_parallel_override(parallel, no_parallel);
+    let static_parallel =
+        parallel_override.unwrap_or_else(|| config.check.as_ref().is_none_or(|c| c.parallel));
+
+    if fix {
+        checks::run_static_fixes(config, base_dir, !ctx.format.is_structured())?;
+        gate::runner::run_check_toolchain_steps_with_options(
+            base_dir,
+            config,
+            full,
+            true,
+            parallel_override,
+        )?;
+        return checks::run_static_checks_with_options(
+            config,
+            base_dir,
+            &ctx.static_opts(static_parallel),
+        );
+    }
+
+    checks::run_static_checks_with_options(config, base_dir, &ctx.static_opts(static_parallel))?;
+    gate::runner::run_check_toolchain_steps_with_options(
+        base_dir,
+        config,
+        full,
+        false,
+        parallel_override,
+    )
 }
 
 fn handle_hook(action: HookAction, base_dir: &Path) -> Result<()> {
