@@ -16,6 +16,7 @@ anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "cargo"] }
 globset = "0.4"
 ignore = "0.4"
+mimalloc = "0.1.52"
 proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }

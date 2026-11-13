@@ -3,6 +3,7 @@
 //! Enforces maintainability by preventing source files from growing into
 //! monolithic "god files" that resist review and comprehension.
 
+use super::parallel;
 use crate::config::LineCountMode;
 use crate::report::{Diagnostic, Severity, normalize_rel_path};
 use crate::suppression::FileSuppressions;
@@ -253,6 +254,14 @@ pub fn collect_file_length(
     paths: &[PathBuf],
     opts: &FileLengthOptions<'_>,
 ) -> Result<(Vec<FileLengthReport>, Vec<Diagnostic>)> {
+    collect_file_length_with_parallel(paths, opts, true)
+}
+
+pub(crate) fn collect_file_length_with_parallel(
+    paths: &[PathBuf],
+    opts: &FileLengthOptions<'_>,
+    parallel: bool,
+) -> Result<(Vec<FileLengthReport>, Vec<Diagnostic>)> {
     let mode_label = match opts.mode {
         LineCountMode::Physical => "physical",
         LineCountMode::Effective => "effective",
@@ -286,12 +295,9 @@ pub fn collect_file_length(
         },
     );
 
-    let mut reports = Vec::new();
-    let mut diagnostics = Vec::new();
-
-    for path in files {
+    let per_file = parallel::map_items(&files, parallel, |path| {
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-        match fs::read_to_string(&path) {
+        match fs::read_to_string(path) {
             Ok(content) => {
                 let physical_lines = content.lines().count();
                 let effective_lines = count_effective_lines(&content, ext);
@@ -306,18 +312,17 @@ pub fn collect_file_length(
                     mode = mode_label,
                     "counted file lines"
                 );
-                reports.push(FileLengthReport {
+                let report = FileLengthReport {
                     path: path.clone(),
                     lines: measured,
                     physical_lines,
                     effective_lines,
-                });
-
-                if measured > opts.max_lines {
-                    let rel = normalize_rel_path(opts.base_dir, &path);
+                };
+                let diag = (measured > opts.max_lines).then(|| {
+                    let rel = normalize_rel_path(opts.base_dir, path);
                     let suppressions = FileSuppressions::parse(&content);
                     let suppressed = suppressions.is_suppressed("file-length", None);
-                    diagnostics.push(Diagnostic {
+                    Diagnostic {
                         rule_id: "warden/file-length".to_string(),
                         check: "file-length".to_string(),
                         severity: Severity::Error,
@@ -336,12 +341,23 @@ pub fn collect_file_length(
                         metric_value: Some(measured),
                         suppressed,
                         suppression_reason: suppressed.then(|| "inline".to_string()),
-                    });
-                }
+                    }
+                });
+                Some((report, diag))
             }
             Err(err) => {
                 tracing::warn!(file = %path.display(), error = %err, "failed to read file; skipping");
+                None
             }
+        }
+    });
+
+    let mut reports = Vec::new();
+    let mut diagnostics = Vec::new();
+    for (report, diag) in per_file.into_iter().flatten() {
+        reports.push(report);
+        if let Some(d) = diag {
+            diagnostics.push(d);
         }
     }
 

@@ -6,6 +6,7 @@
 //! - Boolean operator transitions (e.g. sequence of `&&` then `||`).
 //! - Labeled break/continue statements.
 
+use super::parallel;
 use crate::report::{Diagnostic, Severity, normalize_rel_path};
 use crate::suppression::FileSuppressions;
 use crate::walker::{WalkOptions, collect_files};
@@ -205,14 +206,94 @@ fn analyze_file_with_content(path: &Path) -> Result<(Vec<ComplexityReport>, File
     let syntax: syn::File = syn::parse_file(&content)
         .with_context(|| format!("Failed to parse Rust syntax in {}", path.display()))?;
 
+    let reports = scan_ast_reports(path, &syntax);
+    let suppressions = FileSuppressions::parse(&content);
+    Ok((reports, suppressions))
+}
+
+pub(crate) fn scan_ast_reports(path: &Path, syntax: &syn::File) -> Vec<ComplexityReport> {
     let mut scanner = FileAstScanner {
         file: path.to_path_buf(),
         reports: Vec::new(),
     };
-    scanner.visit_file(&syntax);
+    scanner.visit_file(syntax);
+    scanner.reports
+}
 
-    let suppressions = FileSuppressions::parse(&content);
-    Ok((scanner.reports, suppressions))
+pub(crate) fn build_complexity_diagnostics(
+    path: &Path,
+    reports: &[ComplexityReport],
+    suppressions: &FileSuppressions,
+    opts: &ComplexityOptions<'_>,
+) -> Vec<Diagnostic> {
+    let rel = normalize_rel_path(opts.base_dir, path);
+    let rel_str = rel.to_string_lossy().replace('\\', "/");
+    let mut diagnostics = Vec::new();
+
+    for report in reports {
+        if report.score > opts.max_complexity {
+            let suppressed = suppressions.is_suppressed("complexity", Some(report.line));
+            diagnostics.push(Diagnostic {
+                rule_id: "warden/complexity".to_string(),
+                check: "complexity".to_string(),
+                severity: Severity::Error,
+                message: format!(
+                    "{}:{} - `{}()` score: {} (> {})",
+                    rel.display(),
+                    report.line,
+                    report.function_name,
+                    report.score,
+                    opts.max_complexity
+                ),
+                file: Some(rel.clone()),
+                line: Some(report.line),
+                column: None,
+                fingerprint: format!("complexity:{}:{}", rel_str, report.function_name),
+                metric_value: Some(report.score),
+                suppressed,
+                suppression_reason: suppressed.then(|| "inline".to_string()),
+            });
+        }
+    }
+
+    diagnostics
+}
+
+pub(crate) fn discover_complexity_files(
+    paths: &[PathBuf],
+    opts: &ComplexityOptions<'_>,
+) -> Vec<PathBuf> {
+    let rust_exts = vec!["rs".to_string()];
+    let files = collect_files(
+        paths,
+        &WalkOptions {
+            extensions: &rust_exts,
+            ignore_patterns: opts.ignore_patterns,
+            respect_gitignore: opts.respect_gitignore,
+            base_dir: Some(opts.base_dir),
+            changeset: opts.changeset,
+        },
+    );
+
+    if !opts.ignore_tests {
+        return files;
+    }
+
+    files
+        .into_iter()
+        .filter(|path| {
+            let path_str = path.to_string_lossy().replace('\\', "/");
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let is_test = path_str.contains("/tests/")
+                || file_name.ends_with("_test.rs")
+                || file_name.ends_with("_tests.rs")
+                || file_name == "tests.rs";
+            if is_test {
+                tracing::trace!(file = %path.display(), "skipping test file");
+            }
+            !is_test
+        })
+        .collect()
 }
 
 pub fn analyze_file(path: &Path) -> Result<Vec<ComplexityReport>> {
@@ -239,79 +320,32 @@ pub fn collect_complexity(
         "starting cognitive complexity check"
     );
 
-    let rust_exts = vec!["rs".to_string()];
-    let files = collect_files(
-        paths,
-        &WalkOptions {
-            extensions: &rust_exts,
-            ignore_patterns: opts.ignore_patterns,
-            respect_gitignore: opts.respect_gitignore,
-            base_dir: Some(opts.base_dir),
-            changeset: opts.changeset,
-        },
-    );
-
-    let mut all_reports = Vec::new();
-    let mut diagnostics = Vec::new();
-    let mut files_scanned = 0;
-
-    for path in files {
-        let path_str = path.to_string_lossy().replace('\\', "/");
-        if opts.ignore_tests {
-            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if path_str.contains("/tests/")
-                || file_name.ends_with("_test.rs")
-                || file_name.ends_with("_tests.rs")
-                || file_name == "tests.rs"
-            {
-                tracing::trace!(file = %path.display(), "skipping test file");
-                continue;
-            }
-        }
-
-        match analyze_file_with_content(&path) {
+    let files = discover_complexity_files(paths, opts);
+    let per_file = parallel::map_items(&files, true, |path| {
+        match analyze_file_with_content(path) {
             Ok((file_reports, suppressions)) => {
                 tracing::trace!(
                     file = %path.display(),
                     functions = file_reports.len(),
                     "analyzed file"
                 );
-                files_scanned += 1;
-                let rel = normalize_rel_path(opts.base_dir, &path);
-                let rel_str = rel.to_string_lossy().replace('\\', "/");
-
-                for report in &file_reports {
-                    if report.score > opts.max_complexity {
-                        let suppressed =
-                            suppressions.is_suppressed("complexity", Some(report.line));
-                        diagnostics.push(Diagnostic {
-                            rule_id: "warden/complexity".to_string(),
-                            check: "complexity".to_string(),
-                            severity: Severity::Error,
-                            message: format!(
-                                "{}:{} - `{}()` score: {} (> {})",
-                                rel.display(),
-                                report.line,
-                                report.function_name,
-                                report.score,
-                                opts.max_complexity
-                            ),
-                            file: Some(rel.clone()),
-                            line: Some(report.line),
-                            column: None,
-                            fingerprint: format!("complexity:{}:{}", rel_str, report.function_name),
-                            metric_value: Some(report.score),
-                            suppressed,
-                            suppression_reason: suppressed.then(|| "inline".to_string()),
-                        });
-                    }
-                }
-                all_reports.extend(file_reports);
+                let diags = build_complexity_diagnostics(path, &file_reports, &suppressions, opts);
+                Some((file_reports, diags))
             }
             Err(err) => {
                 tracing::warn!(file = %path.display(), error = %err, "failed to parse rust file; skipping");
+                None
             }
         }
+    });
+
+    let mut all_reports = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut files_scanned = 0;
+    for item in per_file.into_iter().flatten() {
+        files_scanned += 1;
+        all_reports.extend(item.0);
+        diagnostics.extend(item.1);
     }
 
     Ok((all_reports, files_scanned, diagnostics))

@@ -4,7 +4,7 @@
 //! validates placeholder consistency and strict translation completeness, and generates a
 //! sorted static Rust array for zero-cost runtime lookup.
 
-use crate::checks::i18n_source::{collect_source_keys, placeholders_match};
+use crate::checks::i18n_source::{SourceTranslationKey, collect_source_keys, placeholders_match};
 use crate::report::{Diagnostic, Severity, normalize_rel_path};
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
@@ -518,24 +518,30 @@ fn check_entry_placeholders(
 fn check_source_coverage(
     opts: &I18nOptions<'_>,
     parsed: &[(&str, PathBuf, Vec<PoEntry>)],
+    precomputed_keys: Option<Vec<SourceTranslationKey>>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<()> {
     if opts.source_dirs.is_empty() {
         return Ok(());
     }
-    let resolved_dirs: Vec<PathBuf> = opts
-        .source_dirs
-        .iter()
-        .map(|d| opts.base_dir.join(d))
-        .filter(|d| d.exists())
-        .collect();
-    let source_keys = collect_source_keys(
-        &resolved_dirs,
-        opts.tr_macros,
-        opts.out_file,
-        opts.respect_gitignore,
-        Some(opts.base_dir),
-    )?;
+    let source_keys = match precomputed_keys {
+        Some(keys) => keys,
+        None => {
+            let resolved_dirs: Vec<PathBuf> = opts
+                .source_dirs
+                .iter()
+                .map(|d| opts.base_dir.join(d))
+                .filter(|d| d.exists())
+                .collect();
+            collect_source_keys(
+                &resolved_dirs,
+                opts.tr_macros,
+                opts.out_file,
+                opts.respect_gitignore,
+                Some(opts.base_dir),
+            )?
+        }
+    };
 
     for (locale, po_rel, entries) in parsed {
         let key_set: BTreeSet<(Option<&str>, &str)> =
@@ -590,11 +596,21 @@ fn check_source_coverage(
     Ok(())
 }
 
+pub(crate) fn should_run_i18n(opts: &I18nOptions<'_>) -> bool {
+    opts.changeset
+        .is_none_or(|changed| should_run_i18n_changeset(opts, changed))
+}
+
 /// Collect structured i18n synchronization, quality, and source-coverage diagnostics.
 pub fn collect_i18n(opts: &I18nOptions<'_>) -> Result<Vec<Diagnostic>> {
-    if let Some(changed) = opts.changeset
-        && !should_run_i18n_changeset(opts, changed)
-    {
+    collect_i18n_with_source_keys(opts, None)
+}
+
+pub(crate) fn collect_i18n_with_source_keys(
+    opts: &I18nOptions<'_>,
+    precomputed_keys: Option<Vec<SourceTranslationKey>>,
+) -> Result<Vec<Diagnostic>> {
+    if !should_run_i18n(opts) {
         tracing::info!("skipping i18n check (no .po, catalog, or i18n source changes)");
         return Ok(Vec::new());
     }
@@ -632,7 +648,7 @@ pub fn collect_i18n(opts: &I18nOptions<'_>) -> Result<Vec<Diagnostic>> {
         check_cross_locale_parity(&parsed, &mut diagnostics);
     }
 
-    check_source_coverage(opts, &parsed, &mut diagnostics)?;
+    check_source_coverage(opts, &parsed, precomputed_keys, &mut diagnostics)?;
 
     if diagnostics.is_empty() && opts.emit_text {
         println!(

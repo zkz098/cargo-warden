@@ -5,6 +5,7 @@
 //! - Rust `tr(...)`, `tr!(...)`, `t!(...)`, `gettext(...)` calls/macros via `syn` AST
 //! - Placeholder signatures (`{}`, `{0}`, `{name}`, `%s`, etc.) for translation validation
 
+use super::parallel;
 use crate::walker::{WalkOptions, collect_files};
 use anyhow::Result;
 use std::collections::BTreeMap;
@@ -125,16 +126,34 @@ pub fn placeholders_match(source: &str, translated: &str) -> bool {
     placeholder_signature(source) == placeholder_signature(translated)
 }
 
-/// Scan `source_dirs` for `.slint` `@tr(...)` and `.rs` translation macro/function calls.
-pub fn collect_source_keys(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum I18nSourceKind {
+    Rust,
+    Slint,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct I18nSourceFile {
+    pub(crate) path: PathBuf,
+    pub(crate) kind: I18nSourceKind,
+}
+
+pub(crate) fn resolve_tr_macro_names(tr_macros: &[String]) -> Vec<String> {
+    if tr_macros.is_empty() {
+        vec!["tr".to_string(), "t".to_string(), "gettext".to_string()]
+    } else {
+        tr_macros.to_vec()
+    }
+}
+
+pub(crate) fn discover_i18n_source_files(
     source_dirs: &[PathBuf],
-    tr_macros: &[String],
     out_file: &Path,
     respect_gitignore: bool,
     base_dir: Option<&Path>,
-) -> Result<Vec<SourceTranslationKey>> {
+) -> Vec<I18nSourceFile> {
     if source_dirs.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     let exts = vec!["rs".to_string(), "slint".to_string()];
     let files = collect_files(
@@ -149,27 +168,54 @@ pub fn collect_source_keys(
     );
 
     let out_canon = fs::canonicalize(out_file).ok();
-    let macro_names: Vec<&str> = if tr_macros.is_empty() {
-        vec!["tr", "t", "gettext"]
-    } else {
-        tr_macros.iter().map(String::as_str).collect()
-    };
-
-    let mut keys = Vec::new();
+    let mut out = Vec::new();
     for file in files {
         if is_generated_catalog(&file, out_file, out_canon.as_deref()) {
             continue;
         }
         let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
         if ext == "slint" {
-            let content = fs::read_to_string(&file)?;
-            keys.extend(extract_slint_keys(&file, &content));
+            out.push(I18nSourceFile {
+                path: file,
+                kind: I18nSourceKind::Slint,
+            });
         } else if ext == "rs" && !is_rust_test_file(&file) {
-            let content = fs::read_to_string(&file)?;
-            keys.extend(extract_rust_keys(&file, &content, &macro_names));
+            out.push(I18nSourceFile {
+                path: file,
+                kind: I18nSourceKind::Rust,
+            });
         }
     }
+    out
+}
 
+/// Scan `source_dirs` for `.slint` `@tr(...)` and `.rs` translation macro/function calls.
+pub fn collect_source_keys(
+    source_dirs: &[PathBuf],
+    tr_macros: &[String],
+    out_file: &Path,
+    respect_gitignore: bool,
+    base_dir: Option<&Path>,
+) -> Result<Vec<SourceTranslationKey>> {
+    let files = discover_i18n_source_files(source_dirs, out_file, respect_gitignore, base_dir);
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let macro_owned = resolve_tr_macro_names(tr_macros);
+    let macro_names: Vec<&str> = macro_owned.iter().map(String::as_str).collect();
+
+    let per_file = parallel::map_items(&files, true, |item| -> Result<Vec<SourceTranslationKey>> {
+        let content = fs::read_to_string(&item.path)?;
+        Ok(match item.kind {
+            I18nSourceKind::Slint => extract_slint_keys(&item.path, &content),
+            I18nSourceKind::Rust => extract_rust_keys(&item.path, &content, &macro_names),
+        })
+    });
+
+    let mut keys = Vec::new();
+    for res in per_file {
+        keys.extend(res?);
+    }
     Ok(keys)
 }
 
@@ -384,6 +430,21 @@ fn parse_slint_string(content: &str, start: usize) -> Option<(String, usize, usi
     None
 }
 
+/// Extract translation keys from an already-parsed Rust AST, ignoring `#[cfg(test)]`.
+pub(crate) fn extract_rust_keys_from_ast(
+    file: &Path,
+    ast: &syn::File,
+    tr_macros: &[&str],
+) -> Vec<SourceTranslationKey> {
+    let mut visitor = RustTrVisitor {
+        file,
+        tr_macros,
+        keys: Vec::new(),
+    };
+    visitor.visit_file(ast);
+    visitor.keys
+}
+
 /// Extract translation keys from a Rust file via `syn`, ignoring `#[cfg(test)]`.
 pub fn extract_rust_keys(
     file: &Path,
@@ -393,13 +454,7 @@ pub fn extract_rust_keys(
     let Ok(ast) = syn::parse_file(content) else {
         return Vec::new();
     };
-    let mut visitor = RustTrVisitor {
-        file,
-        tr_macros,
-        keys: Vec::new(),
-    };
-    visitor.visit_file(&ast);
-    visitor.keys
+    extract_rust_keys_from_ast(file, &ast, tr_macros)
 }
 
 struct RustTrVisitor<'a> {

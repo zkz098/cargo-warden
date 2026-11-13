@@ -5,6 +5,7 @@
 //! - `apply`: Rewrites hex literals into `Theme.c<hex>` and injects import statements.
 //! - `generate`: Emits `theme.slint` from a declarative color mapping.
 
+use super::parallel;
 use crate::report::{Diagnostic, Severity, normalize_rel_path};
 use crate::suppression::FileSuppressions;
 use crate::walker::{WalkOptions, collect_files};
@@ -244,6 +245,14 @@ pub struct SlintThemeOptions<'a> {
 
 /// Collect structured Slint theme diagnostics (line-accurate, comment/string-safe, inline suppression aware).
 pub fn collect_theme(ui_dir: &Path, opts: &SlintThemeOptions<'_>) -> Result<Vec<Diagnostic>> {
+    collect_theme_with_parallel(ui_dir, opts, true)
+}
+
+pub(crate) fn collect_theme_with_parallel(
+    ui_dir: &Path,
+    opts: &SlintThemeOptions<'_>,
+    parallel: bool,
+) -> Result<Vec<Diagnostic>> {
     if opts.emit_text {
         println!(
             "[slint-theme] scanning {} for unmapped color literals...",
@@ -277,14 +286,14 @@ pub fn collect_theme(ui_dir: &Path, opts: &SlintThemeOptions<'_>) -> Result<Vec<
         .collect();
     let hex_re = Regex::new(r"#([0-9a-fA-F]{3,8})\b")?;
     let rgb_re = Regex::new(r"\brgba?\s*\([^)]*\)")?;
-    let mut diagnostics = Vec::new();
 
-    for file in &slint_files {
+    let per_file = parallel::map_items(&slint_files, parallel, |file| -> Result<Vec<Diagnostic>> {
         let text = fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
         let masked = mask_comments_and_strings(&text);
         let rel = normalize_rel_path(opts.base_dir, file);
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         let suppressions = FileSuppressions::parse(&text);
+        let mut file_diags = Vec::new();
 
         for (idx, line) in masked.lines().enumerate() {
             let line_no = idx + 1;
@@ -292,7 +301,7 @@ pub fn collect_theme(ui_dir: &Path, opts: &SlintThemeOptions<'_>) -> Result<Vec<
                 find_unmapped_in_masked_line(line, &hex_re, &rgb_re, &unchanged_set)
             {
                 let suppressed = suppressions.is_suppressed("slint-theme", Some(line_no));
-                diagnostics.push(Diagnostic {
+                file_diags.push(Diagnostic {
                     rule_id: "warden/slint-theme".to_string(),
                     check: "slint-theme".to_string(),
                     severity: Severity::Error,
@@ -307,6 +316,12 @@ pub fn collect_theme(ui_dir: &Path, opts: &SlintThemeOptions<'_>) -> Result<Vec<
                 });
             }
         }
+        Ok(file_diags)
+    });
+
+    let mut diagnostics = Vec::new();
+    for res in per_file {
+        diagnostics.extend(res?);
     }
 
     Ok(diagnostics)
