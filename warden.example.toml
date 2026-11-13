@@ -54,10 +54,27 @@ fanout_crates = []
 # Directory containing .slint files
 ui_dir = "crates/my-app/ui"
 out_file = "crates/my-app/ui/theme.slint"
+# Optional design token definition (TOML or W3C DTCG `.tokens.json`)
+# theme_def = "tokens.tokens.json"
 # Hex colors permitted to stay as raw literals
 unchanged_colors = [
     "ffffff", "000000", "6b7280", "ffffff55"
 ]
+# Optional glob/prefix exclusions under ui_dir (`out_file` is always excluded)
+# exclude = ["generated/**"]
+# verify_generated = true
+# check_unknown_tokens = true
+# check_unused_tokens = false
+
+# [slint_theme.rules]
+# color = true
+# spacing = true
+# radius = true
+# typography = true
+# duration = true
+# allowed_lengths = ["0px", "1px"]
+# allowed_durations = ["0ms", "0s"]
+# spacing_grid = 4
 
 [i18n]
 # Directory containing `<locale>/LC_MESSAGES/<domain>.po`

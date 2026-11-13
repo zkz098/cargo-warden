@@ -243,23 +243,30 @@ fn run_slint_theme_task(
     if !ui_dir.exists() {
         return Ok(None);
     }
-    let diags = slint_theme::collect_theme_with_parallel(
+    let diags = slint_theme::collect_theme_with_policy(
         &ui_dir,
-        &slint_theme::SlintThemeOptions {
+        &slint_theme::SlintThemePolicy {
             base_dir,
-            unchanged: &theme_cfg.unchanged_colors,
+            out_file: &theme_cfg.out_file,
+            theme_def: theme_cfg.theme_def.as_deref(),
+            unchanged_colors: &theme_cfg.unchanged_colors,
+            exclude: &theme_cfg.exclude,
             respect_gitignore: theme_cfg.respect_gitignore,
+            verify_generated: theme_cfg.verify_generated,
+            check_unknown_tokens: theme_cfg.check_unknown_tokens,
+            check_unused_tokens: theme_cfg.check_unused_tokens,
+            rules: &theme_cfg.rules,
             changeset: opts.changeset,
             emit_text: false,
+            parallel,
         },
-        parallel,
     )?;
     let ok_line = (!diags
         .iter()
         .any(|d| !d.suppressed && d.severity == Severity::Error))
     .then(|| {
         format!(
-            "[slint-theme] OK: all hex colors in {} are mapped or whitelisted",
+            "[slint-theme] OK: {} satisfies all enabled Slint token/UI rules",
             ui_dir.display()
         )
     });

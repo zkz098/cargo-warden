@@ -250,6 +250,15 @@ fn rule_short_description(rule_id: &str) -> &'static str {
         "warden/file-length" => "File line count exceeds threshold",
         "warden/ci-parity" => "Workspace crate missing from CI test coverage",
         "warden/slint-theme" => "Unmapped hardcoded hex color in Slint UI file",
+        "warden/slint/spacing" => "Hardcoded spacing or padding length in Slint UI file",
+        "warden/slint/radius" => "Hardcoded border radius or width in Slint UI file",
+        "warden/slint/typography" => "Hardcoded font size, family, or weight in Slint UI file",
+        "warden/slint/duration" => "Hardcoded animation duration in Slint UI file",
+        "warden/slint/unknown-token" => "Reference to undefined Slint Theme token",
+        "warden/slint/unused-token" => "Defined Slint design token is not referenced in UI files",
+        "warden/slint/theme-out-of-date" => {
+            "Generated Slint theme file is out of sync with theme definition"
+        }
         "warden/i18n" => "Generated Rust i18n catalog is out of sync with .po files",
         "warden/unused-suppression" => {
             "Inline `warden:allow` directive did not match any violation"

@@ -71,17 +71,20 @@ cargo warden ci-parity --workflow .github/workflows/ci.yml
 - Scans matching test lines in the CI workflow (e.g., `nextest`, `llvm-cov`, `cargo test`).
 - Reports active workspace crates missing from CI test runs.
 
-### 3. Slint Theme Color Guard (`theme`)
+### 3. Slint Design Token & UI Specification Guard (`theme`)
 
 ```bash
 # Check for unmapped hardcoded colors (#rgb, #rgba, #rrggbb, #rrggbbaa, rgb(), rgba())
 # Comments and string literals are automatically ignored.
 cargo warden theme check --ui-dir ui/
 
-# Rewrite hardcoded hex colors to Theme.c<hex> and inject path-relative imports
+# Enforce all UI token rules (color, spacing, radius, typography, duration) + token validation
+cargo warden theme check --all-rules --unknown-tokens --unused-tokens --verify-generated
+
+# Rewrite hardcoded hex colors to Theme tokens and inject path-relative imports
 cargo warden theme apply --ui-dir ui/
 
-# Generate theme.slint from the configured theme definition
+# Generate theme.slint from TOML or W3C DTCG `.tokens.json` definition
 cargo warden theme generate --out-file ui/theme.slint
 ```
 

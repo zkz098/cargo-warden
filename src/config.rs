@@ -187,11 +187,64 @@ pub struct SlintThemeConfig {
     pub out_file: PathBuf,
     /// Hex colors that are allowed to remain literal (whitelist)
     pub unchanged_colors: Vec<String>,
-    /// Theme color mapping source file (optional TOML with dark->light and accents)
+    /// Theme token definition source file (TOML or W3C DTCG `.tokens.json`)
     pub theme_def: Option<PathBuf>,
     /// Respect `.gitignore` rules while scanning UI directory
     #[serde(default = "default_true")]
     pub respect_gitignore: bool,
+    /// Additional file names or glob patterns under `ui_dir` to skip when checking
+    pub exclude: Vec<String>,
+    /// Fail when `out_file` is missing or out of sync with `theme_def`
+    pub verify_generated: bool,
+    /// Fail when `.slint` files reference an undefined `Theme.<token>`
+    pub check_unknown_tokens: bool,
+    /// Emit warnings for tokens defined in `theme_def` that are never referenced in `ui_dir`
+    pub check_unused_tokens: bool,
+    /// Per-category Slint UI specification rule settings
+    pub rules: SlintRulesConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SlintRulesConfig {
+    /// Enforce color token usage (`#hex`, `rgb()`, `rgba()`)
+    #[serde(default = "default_true")]
+    pub color: bool,
+    /// Disallow hardcoded lengths in `spacing`, `padding*`, `margin`, and `gap`
+    pub spacing: bool,
+    /// Disallow hardcoded lengths in `border-radius` and `border-width`
+    pub radius: bool,
+    /// Disallow hardcoded `font-size`, `font-family`, and `font-weight` literals
+    pub typography: bool,
+    /// Disallow hardcoded `<duration>` literals in `duration` / `animate` blocks
+    pub duration: bool,
+    /// Dimension literals exempted from spacing/radius checks (e.g. `"0px"`, `"1px"`)
+    pub allowed_lengths: Vec<String>,
+    /// Duration literals exempted from duration checks (e.g. `"0ms"`, `"0s"`)
+    pub allowed_durations: Vec<String>,
+    /// Font family names exempted from typography checks
+    pub allowed_font_families: Vec<String>,
+    /// Font weights exempted from typography checks (e.g. `"400"`)
+    pub allowed_font_weights: Vec<String>,
+    /// Optional px grid step (when set, non-zero integer px values divisible by this step are permitted for spacing)
+    pub spacing_grid: Option<u32>,
+}
+
+impl Default for SlintRulesConfig {
+    fn default() -> Self {
+        Self {
+            color: true,
+            spacing: false,
+            radius: false,
+            typography: false,
+            duration: false,
+            allowed_lengths: vec!["0px".to_string(), "0".to_string()],
+            allowed_durations: vec!["0ms".to_string(), "0s".to_string()],
+            allowed_font_families: Vec::new(),
+            allowed_font_weights: Vec::new(),
+            spacing_grid: None,
+        }
+    }
 }
 
 impl Default for SlintThemeConfig {
@@ -206,6 +259,11 @@ impl Default for SlintThemeConfig {
             ],
             theme_def: None,
             respect_gitignore: true,
+            exclude: Vec::new(),
+            verify_generated: false,
+            check_unknown_tokens: false,
+            check_unused_tokens: false,
+            rules: SlintRulesConfig::default(),
         }
     }
 }

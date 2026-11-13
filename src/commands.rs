@@ -367,20 +367,54 @@ pub(crate) fn handle_theme(
     action: ThemeAction,
     ctx: &RuntimeContext,
 ) -> Result<()> {
-    let theme_cfg = config.slint_theme.clone().unwrap_or_default();
+    let mut theme_cfg = config.slint_theme.clone().unwrap_or_default();
     match action {
-        ThemeAction::Check { ui_dir } => {
+        ThemeAction::Check {
+            ui_dir,
+            spacing,
+            radius,
+            typography,
+            duration,
+            all_rules,
+            unknown_tokens,
+            unused_tokens,
+            verify_generated,
+        } => {
+            if all_rules {
+                theme_cfg.rules.color = true;
+                theme_cfg.rules.spacing = true;
+                theme_cfg.rules.radius = true;
+                theme_cfg.rules.typography = true;
+                theme_cfg.rules.duration = true;
+            } else {
+                theme_cfg.rules.spacing |= spacing;
+                theme_cfg.rules.radius |= radius;
+                theme_cfg.rules.typography |= typography;
+                theme_cfg.rules.duration |= duration;
+            }
+            theme_cfg.check_unknown_tokens |= unknown_tokens;
+            theme_cfg.check_unused_tokens |= unused_tokens;
+            theme_cfg.verify_generated |= verify_generated;
+
             let dir = ui_dir.unwrap_or_else(|| theme_cfg.ui_dir.clone());
             let emit_text = !ctx.format.is_structured();
             let full_dir = base_dir.join(&dir);
-            let diagnostics = checks::slint_theme::collect_theme(
+            let diagnostics = checks::slint_theme::collect_theme_with_policy(
                 &full_dir,
-                &checks::slint_theme::SlintThemeOptions {
+                &checks::slint_theme::SlintThemePolicy {
                     base_dir,
-                    unchanged: &theme_cfg.unchanged_colors,
+                    out_file: &theme_cfg.out_file,
+                    theme_def: theme_cfg.theme_def.as_deref(),
+                    unchanged_colors: &theme_cfg.unchanged_colors,
+                    exclude: &theme_cfg.exclude,
                     respect_gitignore: theme_cfg.respect_gitignore,
+                    verify_generated: theme_cfg.verify_generated,
+                    check_unknown_tokens: theme_cfg.check_unknown_tokens,
+                    check_unused_tokens: theme_cfg.check_unused_tokens,
+                    rules: &theme_cfg.rules,
                     changeset: ctx.changeset.as_ref(),
                     emit_text,
+                    parallel: true,
                 },
             )?;
             if emit_text
@@ -389,7 +423,7 @@ pub(crate) fn handle_theme(
                     .any(|d| !d.suppressed && d.severity == Severity::Error)
             {
                 println!(
-                    "[slint-theme] OK: all hex colors in {} are mapped or whitelisted",
+                    "[slint-theme] OK: {} satisfies all enabled Slint token/UI rules",
                     full_dir.display()
                 );
             }
@@ -398,7 +432,7 @@ pub(crate) fn handle_theme(
                 &config,
                 base_dir,
                 ctx,
-                "Unmapped hex colors remain in .slint components",
+                "Slint design token / UI specification violation(s) remain",
             )
         }
         ThemeAction::Apply { ui_dir } => {
@@ -416,8 +450,7 @@ pub(crate) fn handle_theme(
             let out = out_file.unwrap_or(theme_cfg.out_file);
             let def = match &theme_cfg.theme_def {
                 Some(def_path) => {
-                    let content = std::fs::read_to_string(base_dir.join(def_path))?;
-                    toml::from_str(&content)?
+                    checks::slint_theme::load_theme_definition(&base_dir.join(def_path))?
                 }
                 None => checks::slint_theme::ThemeDefinition::default(),
             };

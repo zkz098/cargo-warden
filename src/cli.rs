@@ -314,17 +314,41 @@ pub enum HookAction {
 
 #[derive(Subcommand, Debug)]
 pub enum ThemeAction {
-    /// Scan for unmapped hardcoded hex literals in .slint files
+    /// Scan .slint files for unmapped literals and UI specification violations
     Check {
         #[arg(long)]
         ui_dir: Option<PathBuf>,
+        /// Enable spacing/padding/margin literal checks
+        #[arg(long)]
+        spacing: bool,
+        /// Enable border-radius and border-width literal checks
+        #[arg(long)]
+        radius: bool,
+        /// Enable font-size, font-family, and font-weight literal checks
+        #[arg(long)]
+        typography: bool,
+        /// Enable animation duration literal checks
+        #[arg(long)]
+        duration: bool,
+        /// Enable all UI token rules (color, spacing, radius, typography, duration)
+        #[arg(long)]
+        all_rules: bool,
+        /// Verify all `Theme.<token>` references exist in `theme_def` or `out_file`
+        #[arg(long)]
+        unknown_tokens: bool,
+        /// Warn on defined tokens not referenced in `ui_dir`
+        #[arg(long)]
+        unused_tokens: bool,
+        /// Fail if generated `out_file` is out of sync with `theme_def`
+        #[arg(long)]
+        verify_generated: bool,
     },
     /// Automatically rewrite hardcoded hex colors to Theme.c<hex>
     Apply {
         #[arg(long)]
         ui_dir: Option<PathBuf>,
     },
-    /// Generate theme.slint from definition
+    /// Generate theme.slint from TOML or W3C DTCG JSON definition
     Generate {
         #[arg(long)]
         out_file: Option<PathBuf>,
