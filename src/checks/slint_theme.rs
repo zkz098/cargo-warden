@@ -7,7 +7,7 @@
 
 use super::parallel;
 use crate::report::{Diagnostic, Severity, normalize_rel_path};
-use crate::suppression::FileSuppressions;
+use crate::suppression::{FileSuppressions, collect_unused_suppression_diagnostics};
 use crate::walker::{WalkOptions, collect_files};
 use anyhow::{Context, Result, bail};
 use regex::Regex;
@@ -316,6 +316,12 @@ pub(crate) fn collect_theme_with_parallel(
                 });
             }
         }
+        file_diags.extend(collect_unused_suppression_diagnostics(
+            &rel,
+            &suppressions,
+            &["slint-theme"],
+            &file_diags,
+        ));
         Ok(file_diags)
     });
 
@@ -329,7 +335,10 @@ pub(crate) fn collect_theme_with_parallel(
 
 pub fn check_theme_with_options(ui_dir: &Path, opts: &SlintThemeOptions<'_>) -> Result<()> {
     let diagnostics = collect_theme(ui_dir, opts)?;
-    let active: Vec<&Diagnostic> = diagnostics.iter().filter(|d| !d.suppressed).collect();
+    let active: Vec<&Diagnostic> = diagnostics
+        .iter()
+        .filter(|d| !d.suppressed && d.severity == Severity::Error)
+        .collect();
     if active.is_empty() {
         if opts.emit_text {
             println!(

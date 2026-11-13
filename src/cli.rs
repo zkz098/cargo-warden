@@ -9,6 +9,7 @@ pub enum OutputFormatArg {
     Text,
     Json,
     Sarif,
+    GithubActions,
 }
 
 impl From<OutputFormatArg> for OutputFormat {
@@ -17,6 +18,7 @@ impl From<OutputFormatArg> for OutputFormat {
             OutputFormatArg::Text => OutputFormat::Text,
             OutputFormatArg::Json => OutputFormat::Json,
             OutputFormatArg::Sarif => OutputFormat::Sarif,
+            OutputFormatArg::GithubActions => OutputFormat::GithubActions,
         }
     }
 }
@@ -104,6 +106,9 @@ pub enum Commands {
         /// Top-level modules that must not be imported
         #[arg(long)]
         forbid: Vec<String>,
+        /// Run workspace crate-level dependency boundary checks (`[dag.workspace]`)
+        #[arg(long)]
+        workspace: bool,
     },
 
     /// Ensure all workspace members are covered in CI test runs
@@ -128,11 +133,17 @@ pub enum Commands {
         action: I18nAction,
     },
 
-    /// Scan Rust functions for cognitive complexity violations
+    /// Scan Rust functions for cognitive complexity, length, and nesting violations
     Complexity {
         /// Maximum allowed cognitive complexity score per function
         #[arg(long)]
         max: Option<usize>,
+        /// Maximum allowed lines per function/method
+        #[arg(long)]
+        max_lines: Option<usize>,
+        /// Maximum allowed control-flow nesting depth per function/method
+        #[arg(long)]
+        max_nesting: Option<usize>,
         /// Paths or files to inspect
         #[arg(long)]
         paths: Vec<PathBuf>,
@@ -212,6 +223,20 @@ pub enum Commands {
         #[command(subcommand)]
         action: HookAction,
     },
+
+    /// Diagnose cargo-warden configuration, toolchain, gate tools, and Git hooks
+    Doctor {
+        /// Treat warnings (such as missing config or unpinned toolchains) as failures
+        #[arg(long)]
+        strict: bool,
+    },
+
+    /// Generate shell completion scripts for bash, zsh, fish, powershell, or elvish
+    Completions {
+        /// Target shell
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -227,6 +252,15 @@ pub enum BaselineAction {
         /// Baseline file path to check against
         #[arg(long)]
         path: Option<PathBuf>,
+    },
+    /// Remove stale baseline entries that no longer match any active violation
+    Prune {
+        /// Baseline file path to prune (defaults to config `baseline` or `warden-baseline.json`)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Report stale entries without modifying the baseline file
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 

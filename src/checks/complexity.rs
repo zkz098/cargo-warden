@@ -7,17 +7,18 @@
 //! - Labeled break/continue statements.
 
 use super::parallel;
+use crate::config::ComplexityOverride;
 use crate::report::{Diagnostic, Severity, normalize_rel_path};
-use crate::suppression::FileSuppressions;
-use crate::walker::{WalkOptions, collect_files};
+use crate::suppression::{FileSuppressions, collect_unused_suppression_diagnostics};
+use crate::walker::{PathPatternMatcher, WalkOptions, collect_files};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use syn::visit::{self, Visit};
 use syn::{
-    BinOp, Expr, ExprBinary, ExprBreak, ExprClosure, ExprContinue, ExprForLoop, ExprIf, ExprLoop,
-    ExprMatch, ExprWhile, ImplItemFn, ItemFn, Pat,
+    BinOp, Block, Expr, ExprBinary, ExprBreak, ExprClosure, ExprContinue, ExprForLoop, ExprIf,
+    ExprLoop, ExprMatch, ExprWhile, ImplItemFn, ItemFn, Pat, Signature,
 };
 
 #[derive(Debug, Clone)]
@@ -26,14 +27,30 @@ pub struct ComplexityReport {
     pub function_name: String,
     pub line: usize,
     pub score: usize,
+    pub line_count: usize,
+    pub max_nesting: usize,
 }
 
 #[derive(Default)]
 struct ComplexityCalculator {
     score: usize,
     nesting: usize,
+    max_nesting: usize,
     is_else_if: bool,
     last_bool_op: Option<BoolOpKind>,
+}
+
+impl ComplexityCalculator {
+    fn enter_nesting(&mut self) {
+        self.nesting += 1;
+        if self.nesting > self.max_nesting {
+            self.max_nesting = self.nesting;
+        }
+    }
+
+    fn exit_nesting(&mut self) {
+        self.nesting -= 1;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,9 +72,9 @@ impl<'ast> Visit<'ast> for ComplexityCalculator {
         self.visit_expr(&node.cond);
         self.last_bool_op = old_op;
 
-        self.nesting += 1;
+        self.enter_nesting();
         self.visit_block(&node.then_branch);
-        self.nesting -= 1;
+        self.exit_nesting();
 
         if let Some((_, else_expr)) = &node.else_branch {
             match else_expr.as_ref() {
@@ -67,9 +84,9 @@ impl<'ast> Visit<'ast> for ComplexityCalculator {
                 }
                 _ => {
                     self.score += 1;
-                    self.nesting += 1;
+                    self.enter_nesting();
                     self.visit_expr(else_expr);
-                    self.nesting -= 1;
+                    self.exit_nesting();
                 }
             }
         }
@@ -79,7 +96,7 @@ impl<'ast> Visit<'ast> for ComplexityCalculator {
         self.score += 1 + self.nesting;
         self.visit_expr(&node.expr);
 
-        self.nesting += 1;
+        self.enter_nesting();
         for arm in &node.arms {
             if let Pat::Guard(guard_pat) = &arm.pat {
                 self.score += 1;
@@ -87,34 +104,34 @@ impl<'ast> Visit<'ast> for ComplexityCalculator {
             }
             self.visit_expr(&arm.body);
         }
-        self.nesting -= 1;
+        self.exit_nesting();
     }
 
     fn visit_expr_for_loop(&mut self, node: &'ast ExprForLoop) {
         self.score += 1 + self.nesting;
-        self.nesting += 1;
+        self.enter_nesting();
         visit::visit_expr_for_loop(self, node);
-        self.nesting -= 1;
+        self.exit_nesting();
     }
 
     fn visit_expr_while(&mut self, node: &'ast ExprWhile) {
         self.score += 1 + self.nesting;
-        self.nesting += 1;
+        self.enter_nesting();
         visit::visit_expr_while(self, node);
-        self.nesting -= 1;
+        self.exit_nesting();
     }
 
     fn visit_expr_loop(&mut self, node: &'ast ExprLoop) {
         self.score += 1 + self.nesting;
-        self.nesting += 1;
+        self.enter_nesting();
         visit::visit_expr_loop(self, node);
-        self.nesting -= 1;
+        self.exit_nesting();
     }
 
     fn visit_expr_closure(&mut self, node: &'ast ExprClosure) {
-        self.nesting += 1;
+        self.enter_nesting();
         visit::visit_expr_closure(self, node);
-        self.nesting -= 1;
+        self.exit_nesting();
     }
 
     fn visit_expr_break(&mut self, node: &'ast ExprBreak) {
@@ -152,37 +169,44 @@ struct FileAstScanner {
     reports: Vec<ComplexityReport>,
 }
 
-impl<'ast> Visit<'ast> for FileAstScanner {
-    fn visit_item_fn(&mut self, node: &'ast ItemFn) {
+impl FileAstScanner {
+    fn record_fn(&mut self, sig: &Signature, block: &Block) {
         let mut calc = ComplexityCalculator::default();
-        calc.visit_block(&node.block);
+        calc.visit_block(block);
 
-        let name = node.sig.ident.to_string();
-        let line = node.sig.ident.span().start().line;
-        tracing::trace!(function = %name, line, score = calc.score, "cognitive complexity calculated");
+        let name = sig.ident.to_string();
+        let line = sig.ident.span().start().line;
+        let fn_start = sig.fn_token.span.start().line;
+        let fn_end = block.brace_token.span.close().end().line;
+        let line_count = fn_end.saturating_sub(fn_start) + 1;
+
+        tracing::trace!(
+            function = %name,
+            line,
+            score = calc.score,
+            line_count,
+            max_nesting = calc.max_nesting,
+            "function metrics calculated"
+        );
 
         self.reports.push(ComplexityReport {
             file: self.file.clone(),
             function_name: name,
             line,
             score: calc.score,
+            line_count,
+            max_nesting: calc.max_nesting,
         });
+    }
+}
+
+impl<'ast> Visit<'ast> for FileAstScanner {
+    fn visit_item_fn(&mut self, node: &'ast ItemFn) {
+        self.record_fn(&node.sig, &node.block);
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
-        let mut calc = ComplexityCalculator::default();
-        calc.visit_block(&node.block);
-
-        let name = node.sig.ident.to_string();
-        let line = node.sig.ident.span().start().line;
-        tracing::trace!(function = %name, line, score = calc.score, "cognitive complexity calculated");
-
-        self.reports.push(ComplexityReport {
-            file: self.file.clone(),
-            function_name: name,
-            line,
-            score: calc.score,
-        });
+        self.record_fn(&node.sig, &node.block);
     }
 }
 
@@ -196,6 +220,48 @@ pub struct ComplexityOptions<'a> {
     pub respect_gitignore: bool,
     pub changeset: Option<&'a BTreeSet<PathBuf>>,
     pub emit_text: bool,
+}
+
+/// Additional function metrics and path-scoped overrides for complexity checks.
+#[derive(Debug, Clone, Default)]
+pub struct ComplexityPolicy<'a> {
+    pub max_function_lines: Option<usize>,
+    pub max_nesting: Option<usize>,
+    pub overrides: &'a [ComplexityOverride],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EffectiveLimits {
+    max_complexity: usize,
+    max_function_lines: Option<usize>,
+    max_nesting: Option<usize>,
+}
+
+fn resolve_limits(
+    rel_path: &Path,
+    base_max: usize,
+    policy: &ComplexityPolicy<'_>,
+) -> EffectiveLimits {
+    let mut limits = EffectiveLimits {
+        max_complexity: base_max,
+        max_function_lines: policy.max_function_lines,
+        max_nesting: policy.max_nesting,
+    };
+    for ov in policy.overrides {
+        let matcher = PathPatternMatcher::new(&ov.paths);
+        if matcher.matches(rel_path) {
+            if let Some(m) = ov.max {
+                limits.max_complexity = m;
+            }
+            if let Some(fl) = ov.max_function_lines {
+                limits.max_function_lines = Some(fl);
+            }
+            if let Some(mn) = ov.max_nesting {
+                limits.max_nesting = Some(mn);
+            }
+        }
+    }
+    limits
 }
 
 fn analyze_file_with_content(path: &Path) -> Result<(Vec<ComplexityReport>, FileSuppressions)> {
@@ -220,18 +286,20 @@ pub(crate) fn scan_ast_reports(path: &Path, syntax: &syn::File) -> Vec<Complexit
     scanner.reports
 }
 
-pub(crate) fn build_complexity_diagnostics(
+pub(crate) fn build_complexity_diagnostics_with_policy(
     path: &Path,
     reports: &[ComplexityReport],
     suppressions: &FileSuppressions,
     opts: &ComplexityOptions<'_>,
+    policy: &ComplexityPolicy<'_>,
 ) -> Vec<Diagnostic> {
     let rel = normalize_rel_path(opts.base_dir, path);
     let rel_str = rel.to_string_lossy().replace('\\', "/");
+    let limits = resolve_limits(&rel, opts.max_complexity, policy);
     let mut diagnostics = Vec::new();
 
     for report in reports {
-        if report.score > opts.max_complexity {
+        if report.score > limits.max_complexity {
             let suppressed = suppressions.is_suppressed("complexity", Some(report.line));
             diagnostics.push(Diagnostic {
                 rule_id: "warden/complexity".to_string(),
@@ -243,7 +311,7 @@ pub(crate) fn build_complexity_diagnostics(
                     report.line,
                     report.function_name,
                     report.score,
-                    opts.max_complexity
+                    limits.max_complexity
                 ),
                 file: Some(rel.clone()),
                 line: Some(report.line),
@@ -254,8 +322,69 @@ pub(crate) fn build_complexity_diagnostics(
                 suppression_reason: suppressed.then(|| "inline".to_string()),
             });
         }
+
+        if let Some(max_fn_lines) = limits.max_function_lines
+            && report.line_count > max_fn_lines
+        {
+            let suppressed = suppressions.is_suppressed("function-length", Some(report.line))
+                || suppressions.is_suppressed("complexity", Some(report.line));
+            diagnostics.push(Diagnostic {
+                rule_id: "warden/function-length".to_string(),
+                check: "complexity".to_string(),
+                severity: Severity::Error,
+                message: format!(
+                    "{}:{} - `{}()` has {} lines (> {})",
+                    rel.display(),
+                    report.line,
+                    report.function_name,
+                    report.line_count,
+                    max_fn_lines
+                ),
+                file: Some(rel.clone()),
+                line: Some(report.line),
+                column: None,
+                fingerprint: format!("function-length:{}:{}", rel_str, report.function_name),
+                metric_value: Some(report.line_count),
+                suppressed,
+                suppression_reason: suppressed.then(|| "inline".to_string()),
+            });
+        }
+
+        if let Some(max_nest) = limits.max_nesting
+            && report.max_nesting > max_nest
+        {
+            let suppressed = suppressions.is_suppressed("nesting-depth", Some(report.line))
+                || suppressions.is_suppressed("complexity", Some(report.line));
+            diagnostics.push(Diagnostic {
+                rule_id: "warden/nesting-depth".to_string(),
+                check: "complexity".to_string(),
+                severity: Severity::Error,
+                message: format!(
+                    "{}:{} - `{}()` nesting depth: {} (> {})",
+                    rel.display(),
+                    report.line,
+                    report.function_name,
+                    report.max_nesting,
+                    max_nest
+                ),
+                file: Some(rel.clone()),
+                line: Some(report.line),
+                column: None,
+                fingerprint: format!("nesting-depth:{}:{}", rel_str, report.function_name),
+                metric_value: Some(report.max_nesting),
+                suppressed,
+                suppression_reason: suppressed.then(|| "inline".to_string()),
+            });
+        }
     }
 
+    let unused = collect_unused_suppression_diagnostics(
+        &rel,
+        suppressions,
+        &["complexity", "function-length", "nesting-depth"],
+        &diagnostics,
+    );
+    diagnostics.extend(unused);
     diagnostics
 }
 
@@ -300,10 +429,19 @@ pub fn analyze_file(path: &Path) -> Result<Vec<ComplexityReport>> {
     Ok(analyze_file_with_content(path)?.0)
 }
 
-/// Collect complexity reports and structured diagnostics.
+/// Collect complexity, function-length, and nesting-depth reports and structured diagnostics.
 pub fn collect_complexity(
     paths: &[PathBuf],
     opts: &ComplexityOptions<'_>,
+) -> Result<(Vec<ComplexityReport>, usize, Vec<Diagnostic>)> {
+    collect_complexity_with_policy(paths, opts, &ComplexityPolicy::default())
+}
+
+/// Collect complexity diagnostics honoring function length, nesting depth, and path overrides.
+pub fn collect_complexity_with_policy(
+    paths: &[PathBuf],
+    opts: &ComplexityOptions<'_>,
+    policy: &ComplexityPolicy<'_>,
 ) -> Result<(Vec<ComplexityReport>, usize, Vec<Diagnostic>)> {
     if opts.emit_text {
         println!(
@@ -314,6 +452,9 @@ pub fn collect_complexity(
     tracing::debug!(
         roots = ?paths,
         max_complexity = opts.max_complexity,
+        max_function_lines = ?policy.max_function_lines,
+        max_nesting = ?policy.max_nesting,
+        overrides = policy.overrides.len(),
         ignore_tests = opts.ignore_tests,
         respect_gitignore = opts.respect_gitignore,
         ignore_patterns = ?opts.ignore_patterns,
@@ -329,7 +470,13 @@ pub fn collect_complexity(
                     functions = file_reports.len(),
                     "analyzed file"
                 );
-                let diags = build_complexity_diagnostics(path, &file_reports, &suppressions, opts);
+                let diags = build_complexity_diagnostics_with_policy(
+                    path,
+                    &file_reports,
+                    &suppressions,
+                    opts,
+                    policy,
+                );
                 Some((file_reports, diags))
             }
             Err(err) => {
@@ -376,9 +523,12 @@ pub fn check_complexity_with_options(
     opts: &ComplexityOptions<'_>,
 ) -> Result<Vec<ComplexityReport>> {
     let (all_reports, files_scanned, diagnostics) = collect_complexity(paths, opts)?;
-    let active: Vec<&Diagnostic> = diagnostics.iter().filter(|d| !d.suppressed).collect();
+    let active_errors: Vec<&Diagnostic> = diagnostics
+        .iter()
+        .filter(|d| !d.suppressed && d.severity == Severity::Error)
+        .collect();
 
-    if active.is_empty() {
+    if active_errors.is_empty() {
         if opts.emit_text {
             println!(
                 "[complexity] OK: scanned {} functions across {} files, all within limit ({})",
@@ -392,10 +542,10 @@ pub fn check_complexity_with_options(
         if opts.emit_text {
             println!(
                 "[complexity] ❌ {} function(s) exceed maximum cognitive complexity (threshold: {}):",
-                active.len(),
+                active_errors.len(),
                 opts.max_complexity
             );
-            for d in &active {
+            for d in &active_errors {
                 println!("  ❌ {}", d.message);
             }
         }

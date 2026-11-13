@@ -14,6 +14,7 @@ exclude = [".config/", ".github/", ".gitignore", "warden.toml"]
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "cargo"] }
+clap_complete = "4.6"
 globset = "0.4"
 ignore = "0.4"
 mimalloc = "0.1.52"

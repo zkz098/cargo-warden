@@ -31,6 +31,9 @@ pub struct CheckConfig {
     /// Run independent read-only static checks in parallel (default: true)
     #[serde(default = "default_true")]
     pub parallel: bool,
+    /// Emit warnings for unused inline `// warden:allow(...)` directives (default: true)
+    #[serde(default = "default_true")]
+    pub warn_unused_suppressions: bool,
 }
 
 impl Default for CheckConfig {
@@ -40,6 +43,7 @@ impl Default for CheckConfig {
             clippy: false,
             doc: false,
             parallel: true,
+            warn_unused_suppressions: true,
         }
     }
 }
@@ -55,6 +59,8 @@ pub struct DagConfig {
     pub layers: Vec<LayerConfig>,
     /// Explicit module/layer dependency rules
     pub rules: Vec<DagRuleConfig>,
+    /// Workspace crate-level dependency boundary configuration
+    pub workspace: Option<WorkspaceDagConfig>,
 }
 
 impl Default for DagConfig {
@@ -64,8 +70,64 @@ impl Default for DagConfig {
             forbid_imports: Vec::new(),
             layers: Vec::new(),
             rules: Vec::new(),
+            workspace: None,
         }
     }
+}
+
+/// Workspace-level crate dependency boundary configuration (`[dag.workspace]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct WorkspaceDagConfig {
+    /// Enable workspace crate dependency checks even when only checking cycles
+    pub enabled: bool,
+    /// Include `[dev-dependencies]` edges when checking workspace crate boundaries
+    pub include_dev_dependencies: bool,
+    /// Include `[build-dependencies]` edges when checking workspace crate boundaries
+    pub include_build_dependencies: bool,
+    /// Crates (workspace or external) that no other workspace member may depend on
+    pub forbid_deps: Vec<String>,
+    /// Warn when multiple distinct versions of the same external crate exist in resolved metadata
+    pub check_version_conflicts: bool,
+    /// Named architectural layers grouping workspace crates
+    pub layers: Vec<WorkspaceLayerConfig>,
+    /// Explicit crate or layer dependency rules
+    pub rules: Vec<WorkspaceDagRuleConfig>,
+}
+
+impl WorkspaceDagConfig {
+    /// Returns `true` if any workspace-level crate DAG check is configured or explicitly enabled.
+    pub fn is_active(&self) -> bool {
+        self.enabled
+            || !self.forbid_deps.is_empty()
+            || !self.layers.is_empty()
+            || !self.rules.is_empty()
+            || self.check_version_conflicts
+    }
+}
+
+/// Architectural layer definition for workspace crate dependencies.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct WorkspaceLayerConfig {
+    pub name: String,
+    /// Crate names or glob patterns belonging to this layer (defaults to `[name]`)
+    pub crates: Vec<String>,
+    /// Allowed target layers or workspace crates (`None` = unrestricted unless denied)
+    pub allow: Option<Vec<String>>,
+    /// Explicitly forbidden target layers, workspace crates, or external crates
+    pub deny: Vec<String>,
+}
+
+/// Direct dependency boundary rule between workspace crates or layers.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct WorkspaceDagRuleConfig {
+    pub from: String,
+    /// Allowed target workspace crates or layers (`None` = unrestricted unless denied)
+    pub allow_only: Option<Vec<String>>,
+    /// Forbidden target layers, workspace crates, or external crates
+    pub deny: Vec<String>,
 }
 
 /// Architectural layer definition for `dag` boundary enforcement.
@@ -197,11 +259,29 @@ impl Default for I18nConfig {
     }
 }
 
+/// Path-scoped threshold override for `complexity`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ComplexityOverride {
+    /// Relative path prefixes or glob patterns (e.g. `crates/parser/**`, `src/legacy.rs`)
+    pub paths: Vec<String>,
+    /// Override maximum allowed cognitive complexity score
+    pub max: Option<usize>,
+    /// Override maximum allowed function line count
+    pub max_function_lines: Option<usize>,
+    /// Override maximum allowed control-flow nesting depth
+    pub max_nesting: Option<usize>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ComplexityConfig {
     /// Maximum allowed cognitive complexity per function/method
     pub max: usize,
+    /// Optional maximum allowed lines per function/method
+    pub max_function_lines: Option<usize>,
+    /// Optional maximum allowed nesting depth per function/method
+    pub max_nesting: Option<usize>,
     /// Roots/paths to scan (default: ["."])
     pub paths: Vec<PathBuf>,
     /// Exclude test files (*_test.rs, tests.rs, tests/ directory)
@@ -211,16 +291,21 @@ pub struct ComplexityConfig {
     /// Respect `.gitignore` rules while scanning
     #[serde(default = "default_true")]
     pub respect_gitignore: bool,
+    /// Path-scoped threshold overrides (evaluated in order; last match wins)
+    pub overrides: Vec<ComplexityOverride>,
 }
 
 impl Default for ComplexityConfig {
     fn default() -> Self {
         Self {
             max: 20,
+            max_function_lines: None,
+            max_nesting: None,
             paths: vec![PathBuf::from(".")],
             ignore_tests: true,
             ignore: vec!["target".to_string()],
             respect_gitignore: true,
+            overrides: Vec::new(),
         }
     }
 }
@@ -234,6 +319,18 @@ pub enum LineCountMode {
     Physical,
     /// Count only effective code lines (SLOC), excluding blank lines and comments.
     Effective,
+}
+
+/// Path-scoped threshold override for `file_length`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct FileLengthOverride {
+    /// Relative path prefixes or glob patterns (e.g. `crates/ui/**`, `*.slint`)
+    pub paths: Vec<String>,
+    /// Override maximum allowed line count
+    pub max_lines: Option<usize>,
+    /// Override line counting mode (`physical` or `effective`)
+    pub mode: Option<LineCountMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,6 +349,8 @@ pub struct FileLengthConfig {
     /// Respect `.gitignore` rules while scanning
     #[serde(default = "default_true")]
     pub respect_gitignore: bool,
+    /// Path-scoped threshold overrides (evaluated in order; last match wins)
+    pub overrides: Vec<FileLengthOverride>,
 }
 
 impl Default for FileLengthConfig {
@@ -263,6 +362,7 @@ impl Default for FileLengthConfig {
             ignore: vec!["target".to_string(), "tests".to_string()],
             mode: LineCountMode::Physical,
             respect_gitignore: true,
+            overrides: Vec::new(),
         }
     }
 }
@@ -347,9 +447,23 @@ pub struct TestGroupConfig {
     pub features: Vec<String>,
 }
 
+/// Origin from which a `WardenConfig` was loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// Loaded from `warden.toml` or `.warden.toml`.
+    File(PathBuf),
+    /// Loaded from `[workspace.metadata.warden]` in `Cargo.toml`.
+    CargoMetadata(PathBuf),
+}
+
 impl WardenConfig {
-    /// Try to locate and load `warden.toml` or `.warden.toml` in `root` or parent dirs.
+    /// Try to locate and load `warden.toml`, `.warden.toml`, or `[workspace.metadata.warden]`.
     pub fn load(root: &Path) -> Result<Self> {
+        Ok(Self::load_with_source(root)?.0)
+    }
+
+    /// Locate and load configuration along with its discovered source, if any.
+    pub fn load_with_source(root: &Path) -> Result<(Self, Option<ConfigSource>)> {
         let candidates = [root.join("warden.toml"), root.join(".warden.toml")];
 
         for path in &candidates {
@@ -358,7 +472,7 @@ impl WardenConfig {
                     .with_context(|| format!("Failed to read config file {}", path.display()))?;
                 let config: WardenConfig = toml::from_str(&content)
                     .with_context(|| format!("Failed to parse TOML in {}", path.display()))?;
-                return Ok(config);
+                return Ok((config, Some(ConfigSource::File(path.clone()))));
             }
         }
 
@@ -373,9 +487,9 @@ impl WardenConfig {
                 .and_then(|m| m.get("warden"))
             && let Ok(config) = metadata.clone().try_into()
         {
-            return Ok(config);
+            return Ok((config, Some(ConfigSource::CargoMetadata(cargo_toml))));
         }
 
-        Ok(WardenConfig::default())
+        Ok((WardenConfig::default(), None))
     }
 }

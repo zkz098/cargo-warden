@@ -135,3 +135,53 @@ pub fn collect_files(roots: &[PathBuf], opts: &WalkOptions<'_>) -> Vec<PathBuf> 
     files.sort();
     files
 }
+
+/// Compiled matcher for path prefixes or glob patterns (e.g. `crates/ui/**`, `src/legacy.rs`).
+#[derive(Debug, Clone, Default)]
+pub struct PathPatternMatcher {
+    prefixes: Vec<String>,
+    globs: Vec<GlobMatcher>,
+}
+
+impl PathPatternMatcher {
+    /// Build a matcher from raw path prefixes and/or glob patterns.
+    pub fn new(patterns: &[String]) -> Self {
+        let mut prefixes = Vec::new();
+        let mut globs = Vec::new();
+        for pat in patterns {
+            let trimmed = pat.trim().replace('\\', "/");
+            let cleaned = trimmed.trim_start_matches("./").trim_end_matches('/');
+            if cleaned.is_empty() {
+                continue;
+            }
+            if looks_like_glob(cleaned)
+                && let Ok(glob) = GlobBuilder::new(cleaned).literal_separator(false).build()
+            {
+                globs.push(glob.compile_matcher());
+            } else {
+                prefixes.push(cleaned.to_string());
+            }
+        }
+        Self { prefixes, globs }
+    }
+
+    /// Returns `true` if `rel_path` matches any configured glob or path prefix.
+    pub fn matches(&self, rel_path: &Path) -> bool {
+        let norm = rel_path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .to_string();
+        if self.globs.iter().any(|g| g.is_match(&norm)) {
+            return true;
+        }
+        self.prefixes
+            .iter()
+            .any(|p| norm == *p || norm.starts_with(&format!("{p}/")))
+    }
+
+    /// Returns `true` if `name` (e.g. a workspace crate name) matches any pattern.
+    pub fn matches_name(&self, name: &str) -> bool {
+        self.globs.iter().any(|g| g.is_match(name)) || self.prefixes.iter().any(|p| p == name)
+    }
+}

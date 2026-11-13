@@ -23,6 +23,23 @@ forbid_imports = ["bootstrap"]
 # allow = ["domain", "infra"]
 # deny = ["bootstrap"]
 
+# Optional workspace crate-level dependency boundary rules (`cargo warden dag --workspace`)
+# [dag.workspace]
+# forbid_deps = ["my-bootstrap"]
+# include_dev_dependencies = false
+# check_version_conflicts = false
+#
+# [[dag.workspace.layers]]
+# name = "domain"
+# crates = ["my-domain", "my-types"]
+# allow = []
+#
+# [[dag.workspace.layers]]
+# name = "app"
+# crates = ["my-app"]
+# allow = ["domain", "infra"]
+# deny = ["my-bootstrap"]
+
 [ci_parity]
 # Path to CI workflow file relative to repository root
 workflow = ".github/workflows/ci.yml"
@@ -63,6 +80,9 @@ respect_gitignore = true
 [complexity]
 # Maximum cognitive complexity score allowed per function/method
 max = 25
+# Optional maximum lines and nesting depth per function/method
+# max_function_lines = 120
+# max_nesting = 5
 # Directories to scan
 paths = ["crates", "src"]
 # Skip test files (*_test.rs, tests.rs, tests/ directory)
@@ -70,6 +90,13 @@ ignore_tests = true
 ignore = ["target"]
 # Respect .gitignore rules (default: true)
 respect_gitignore = true
+
+# Optional path-scoped overrides
+# [[complexity.overrides]]
+# paths = ["crates/legacy/**"]
+# max = 40
+# max_function_lines = 200
+# max_nesting = 7
 
 [file_length]
 # Maximum allowed line count
@@ -83,6 +110,12 @@ mode = "physical"
 # Respect .gitignore rules (default: true)
 respect_gitignore = true
 
+# Optional path-scoped overrides
+# [[file_length.overrides]]
+# paths = ["crates/ui/**"]
+# max_lines = 1200
+# mode = "effective"
+
 [check]
 # Optional Cargo toolchain checks during `cargo warden check`
 fmt = true
@@ -90,6 +123,8 @@ clippy = false
 doc = false
 # Run independent static checks in parallel (default: true)
 parallel = true
+# Emit warnings for unused inline `// warden:allow(...)` directives (default: true)
+warn_unused_suppressions = true
 
 [gate]
 # Run configured static checks before Cargo steps (default: true)

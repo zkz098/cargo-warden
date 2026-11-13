@@ -4,10 +4,10 @@
 //! monolithic "god files" that resist review and comprehension.
 
 use super::parallel;
-use crate::config::LineCountMode;
+use crate::config::{FileLengthOverride, LineCountMode};
 use crate::report::{Diagnostic, Severity, normalize_rel_path};
-use crate::suppression::FileSuppressions;
-use crate::walker::{WalkOptions, collect_files};
+use crate::suppression::{FileSuppressions, collect_unused_suppression_diagnostics};
+use crate::walker::{PathPatternMatcher, WalkOptions, collect_files};
 use anyhow::{Result, bail};
 use std::collections::BTreeSet;
 use std::fs;
@@ -249,17 +249,39 @@ fn count_slash_sloc(content: &str, nested_block: bool, is_rust: bool) -> usize {
     content.lines().filter(|l| scanner.scan_line(l)).count()
 }
 
+fn resolve_file_length_limits(
+    rel_path: &Path,
+    opts: &FileLengthOptions<'_>,
+    compiled_overrides: &[(PathPatternMatcher, &FileLengthOverride)],
+) -> (usize, LineCountMode) {
+    let mut max_lines = opts.max_lines;
+    let mut mode = opts.mode;
+    for (matcher, ov) in compiled_overrides {
+        if matcher.matches(rel_path) {
+            if let Some(ml) = ov.max_lines {
+                max_lines = ml;
+            }
+            if let Some(m) = ov.mode {
+                mode = m;
+            }
+        }
+    }
+    (max_lines, mode)
+}
+
 /// Collect structured diagnostics and reports for file lengths.
 pub fn collect_file_length(
     paths: &[PathBuf],
     opts: &FileLengthOptions<'_>,
 ) -> Result<(Vec<FileLengthReport>, Vec<Diagnostic>)> {
-    collect_file_length_with_parallel(paths, opts, true)
+    collect_file_length_with_overrides(paths, opts, &[], true)
 }
 
-pub(crate) fn collect_file_length_with_parallel(
+/// Collect structured diagnostics and reports for file lengths with path-scoped overrides.
+pub fn collect_file_length_with_overrides(
     paths: &[PathBuf],
     opts: &FileLengthOptions<'_>,
+    overrides: &[FileLengthOverride],
     parallel: bool,
 ) -> Result<(Vec<FileLengthReport>, Vec<Diagnostic>)> {
     let mode_label = match opts.mode {
@@ -278,6 +300,7 @@ pub(crate) fn collect_file_length_with_parallel(
         roots = ?paths,
         max_lines = opts.max_lines,
         mode = mode_label,
+        overrides = overrides.len(),
         respect_gitignore = opts.respect_gitignore,
         extensions = ?opts.extensions,
         ignore_patterns = ?opts.ignore_patterns,
@@ -295,13 +318,26 @@ pub(crate) fn collect_file_length_with_parallel(
         },
     );
 
+    let compiled_overrides: Vec<(PathPatternMatcher, &FileLengthOverride)> = overrides
+        .iter()
+        .map(|ov| (PathPatternMatcher::new(&ov.paths), ov))
+        .collect();
+
     let per_file = parallel::map_items(&files, parallel, |path| {
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
         match fs::read_to_string(path) {
             Ok(content) => {
+                let rel = normalize_rel_path(opts.base_dir, path);
+                let (eff_max_lines, eff_mode) =
+                    resolve_file_length_limits(&rel, opts, &compiled_overrides);
+                let eff_mode_label = match eff_mode {
+                    LineCountMode::Physical => "physical",
+                    LineCountMode::Effective => "effective",
+                };
+
                 let physical_lines = content.lines().count();
                 let effective_lines = count_effective_lines(&content, ext);
-                let measured = match opts.mode {
+                let measured = match eff_mode {
                     LineCountMode::Physical => physical_lines,
                     LineCountMode::Effective => effective_lines,
                 };
@@ -309,7 +345,7 @@ pub(crate) fn collect_file_length_with_parallel(
                     file = %path.display(),
                     physical_lines,
                     effective_lines,
-                    mode = mode_label,
+                    mode = eff_mode_label,
                     "counted file lines"
                 );
                 let report = FileLengthReport {
@@ -318,18 +354,24 @@ pub(crate) fn collect_file_length_with_parallel(
                     physical_lines,
                     effective_lines,
                 };
-                let diag = (measured > opts.max_lines).then(|| {
-                    let rel = normalize_rel_path(opts.base_dir, path);
-                    let suppressions = FileSuppressions::parse(&content);
-                    let suppressed = suppressions.is_suppressed("file-length", None);
-                    Diagnostic {
+
+                let has_allow = content.contains("warden:allow");
+                let suppressions = (measured > eff_max_lines || has_allow)
+                    .then(|| FileSuppressions::parse(&content));
+
+                let mut file_diags = Vec::new();
+                if measured > eff_max_lines {
+                    let suppressed = suppressions
+                        .as_ref()
+                        .is_some_and(|s| s.is_suppressed("file-length", None));
+                    file_diags.push(Diagnostic {
                         rule_id: "warden/file-length".to_string(),
                         check: "file-length".to_string(),
                         severity: Severity::Error,
                         message: format!(
-                            "{} has {measured} {mode_label} lines (> {})",
+                            "{} has {measured} {eff_mode_label} lines (> {})",
                             rel.display(),
-                            opts.max_lines
+                            eff_max_lines
                         ),
                         file: Some(rel.clone()),
                         line: None,
@@ -341,9 +383,17 @@ pub(crate) fn collect_file_length_with_parallel(
                         metric_value: Some(measured),
                         suppressed,
                         suppression_reason: suppressed.then(|| "inline".to_string()),
-                    }
-                });
-                Some((report, diag))
+                    });
+                }
+                if let Some(sup) = &suppressions {
+                    file_diags.extend(collect_unused_suppression_diagnostics(
+                        &rel,
+                        sup,
+                        &["file-length"],
+                        &file_diags,
+                    ));
+                }
+                Some((report, file_diags))
             }
             Err(err) => {
                 tracing::warn!(file = %path.display(), error = %err, "failed to read file; skipping");
@@ -354,11 +404,9 @@ pub(crate) fn collect_file_length_with_parallel(
 
     let mut reports = Vec::new();
     let mut diagnostics = Vec::new();
-    for (report, diag) in per_file.into_iter().flatten() {
+    for (report, diags) in per_file.into_iter().flatten() {
         reports.push(report);
-        if let Some(d) = diag {
-            diagnostics.push(d);
-        }
+        diagnostics.extend(diags);
     }
 
     reports.sort_by_key(|a| std::cmp::Reverse(a.lines));
@@ -391,9 +439,12 @@ pub fn check_file_length_with_options(
     opts: &FileLengthOptions<'_>,
 ) -> Result<Vec<FileLengthReport>> {
     let (reports, diagnostics) = collect_file_length(paths, opts)?;
-    let active: Vec<&Diagnostic> = diagnostics.iter().filter(|d| !d.suppressed).collect();
+    let active_errors: Vec<&Diagnostic> = diagnostics
+        .iter()
+        .filter(|d| !d.suppressed && d.severity == Severity::Error)
+        .collect();
 
-    if active.is_empty() {
+    if active_errors.is_empty() {
         if opts.emit_text {
             let mode_label = match opts.mode {
                 LineCountMode::Physical => "lines",
@@ -411,10 +462,10 @@ pub fn check_file_length_with_options(
         if opts.emit_text {
             println!(
                 "[file-length] ❌ {} file(s) exceed maximum length (threshold: {} lines):",
-                active.len(),
+                active_errors.len(),
                 opts.max_lines
             );
-            for d in &active {
+            for d in &active_errors {
                 println!("  ❌ {}", d.message);
             }
         }

@@ -10,16 +10,17 @@ A unified Cargo plugin and code quality toolkit for Rust and Slint projects.
 
 | Module | Command | Description |
 | :--- | :--- | :--- |
-| **Module Dependency DAG Guard** | `cargo warden dag` | Parses Rust module imports via `syn`, detects cycles using Tarjan's SCC algorithm, and enforces forbidden imports & layered architecture rules (`[[dag.layers]]` / `[[dag.rules]]`). |
+| **Module & Workspace DAG Guard** | `cargo warden dag` | Parses Rust module imports via `syn` (Tarjan SCC cycles + `[[dag.layers]]` / `[[dag.rules]]`) and enforces workspace crate dependency boundaries via `cargo metadata` (`[dag.workspace]`). |
 | **Workspace & CI Parity Check** | `cargo warden ci-parity` | Compares `cargo metadata` workspace members against CI workflow test lines to catch untested or stale crates. |
 | **Slint Theme Color Guard** | `cargo warden theme [check\|apply\|generate]` | Detects raw `#hex` color literals in `.slint` files, rewrites them to `Theme.c<hex>` with imports, and generates `theme.slint` from TOML. |
 | **Slint & Rust i18n Catalog Sync** | `cargo warden i18n [check\|generate]` | Parses gettext `.po` catalogs, generates a sorted Rust static lookup table, and verifies catalog synchronization. |
-| **Cognitive Complexity Checker** | `cargo warden complexity` | Measures function cognitive complexity via `syn` (control-flow nesting and boolean operator transitions) and reports threshold violations. |
-| **File Length Guard** | `cargo warden file-length` | Enforces physical or effective code line (SLOC) thresholds across configured paths while honoring `.gitignore` and glob ignore patterns. |
-| **Project Init & Baseline** | `cargo warden init` / `baseline` | Auto-detects project layout to generate `warden.toml`, and manages baseline snapshots & `// warden:allow(...)` suppressions. |
+| **Cognitive Complexity & Metrics** | `cargo warden complexity` | Measures function cognitive complexity, function length, and nesting depth via `syn` with path-scoped `[[complexity.overrides]]`. |
+| **File Length Guard** | `cargo warden file-length` | Enforces physical or effective code line (SLOC) thresholds across configured paths with `.gitignore`, glob ignores, and `[[file_length.overrides]]`. |
+| **Project Init & Baseline** | `cargo warden init` / `baseline` | Auto-detects project layout to generate `warden.toml`, manages & prunes baseline snapshots (`baseline prune`), and audits `// warden:allow(...)` suppressions. |
 | **Local CI Verification Gate** | `cargo warden gate` | Mirrors CI pipelines locally (`fmt`, `clippy`, `nextest`/`test`, `doc`, plus optional `machete`, `deny`, and `audit`) with Cargo env scrubbing. |
-| **Unified Static Check** | `cargo warden check` | Runs all configured static checks in milliseconds—supports `--staged`, `--diff <base>`, and `--format text\|json\|sarif`. |
+| **Unified Static Check** | `cargo warden check` | Runs all configured static checks in milliseconds—supports `--staged`, `--diff <base>`, and `--format text\|json\|sarif\|github-actions`. |
 | **Git Hook Management** | `cargo warden hook [install\|uninstall\|status]` | Installs, updates, inspects, and safely uninstalls `pre-commit` / `pre-push` hooks (including `--staged` mode) while preserving existing custom scripts. |
+| **Diagnostics & Completions** | `cargo warden doctor` / `completions` | Checks configuration, toolchain, optional gate tools, and Git hook health (`doctor`), and generates shell completion scripts (`completions`). |
 
 ---
 

@@ -10,7 +10,7 @@ pub mod slint_theme;
 
 use crate::baseline::{BaselineApplyStats, BaselineFile};
 use crate::config::WardenConfig;
-use crate::report::{CheckReport, Diagnostic, OutputFormat};
+use crate::report::{CheckReport, Diagnostic, OutputFormat, Severity};
 use anyhow::{Result, bail};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -70,21 +70,44 @@ pub fn resolve_baseline_path(
 
 /// Apply configured baseline (if present) and build a `CheckReport`.
 pub fn apply_baseline_and_report(
+    diagnostics: Vec<Diagnostic>,
+    base_dir: &Path,
+    config: &WardenConfig,
+    override_path: Option<&Path>,
+    no_baseline: bool,
+) -> Result<(CheckReport, BaselineApplyStats)> {
+    apply_baseline_and_report_with_scope(
+        diagnostics,
+        base_dir,
+        config,
+        override_path,
+        no_baseline,
+        false,
+    )
+}
+
+/// Apply configured baseline (if present), optionally count stale entries on full runs, and build a `CheckReport`.
+pub fn apply_baseline_and_report_with_scope(
     mut diagnostics: Vec<Diagnostic>,
     base_dir: &Path,
     config: &WardenConfig,
     override_path: Option<&Path>,
     no_baseline: bool,
+    is_full_run: bool,
 ) -> Result<(CheckReport, BaselineApplyStats)> {
     let mut stats = BaselineApplyStats::default();
     if let Some(bp) = resolve_baseline_path(base_dir, config, override_path, no_baseline) {
         if bp.is_file() {
             let baseline = BaselineFile::load(&bp)?;
             stats = baseline.apply(&mut diagnostics);
+            if is_full_run {
+                stats.stale = baseline.stale_count(&diagnostics);
+            }
             tracing::debug!(
                 baseline = %bp.display(),
                 suppressed = stats.suppressed,
                 regressions = stats.regressions,
+                stale = stats.stale,
                 "applied baseline suppressions"
             );
         } else if override_path.is_some() {
@@ -109,7 +132,7 @@ fn run_file_length_task(
         return Ok(None);
     };
     let search_paths = join_paths(base_dir, &fl_cfg.paths);
-    let (reports, diags) = file_length::collect_file_length_with_parallel(
+    let (reports, diags) = file_length::collect_file_length_with_overrides(
         &search_paths,
         &file_length::FileLengthOptions {
             base_dir,
@@ -121,14 +144,50 @@ fn run_file_length_task(
             changeset: opts.changeset,
             emit_text: false,
         },
+        &fl_cfg.overrides,
         parallel,
     )?;
-    let ok_line = (!diags.iter().any(|d| !d.suppressed)).then(|| {
+    let ok_line = (!diags
+        .iter()
+        .any(|d| !d.suppressed && d.severity == Severity::Error))
+    .then(|| {
         format!(
             "[file-length] OK: scanned {} file(s), all within {} lines",
             reports.len(),
             fl_cfg.max_lines
         )
+    });
+    Ok(Some(CheckTaskOutcome {
+        diagnostics: diags,
+        ok_line,
+    }))
+}
+
+fn run_workspace_dag_task(
+    config: &WardenConfig,
+    base_dir: &Path,
+    opts: &StaticRunOptions<'_>,
+) -> Result<Option<CheckTaskOutcome>> {
+    let Some(dag_cfg) = &config.dag else {
+        return Ok(None);
+    };
+    let Some(ws_cfg) = &dag_cfg.workspace else {
+        return Ok(None);
+    };
+    if !ws_cfg.is_active() {
+        return Ok(None);
+    }
+    let diags = dag::workspace::collect_workspace_dag(&dag::workspace::WorkspaceDagOptions {
+        base_dir,
+        config: ws_cfg,
+        changeset: opts.changeset,
+        emit_text: false,
+    })?;
+    let ok_line = (!diags
+        .iter()
+        .any(|d| !d.suppressed && d.severity == Severity::Error))
+    .then(|| {
+        "[workspace-dag] OK: workspace crate dependencies satisfy all boundary rules".to_string()
     });
     Ok(Some(CheckTaskOutcome {
         diagnostics: diags,
@@ -156,7 +215,10 @@ fn run_ci_parity_task(
             emit_text: false,
         },
     )?;
-    let ok_line = (!diags.iter().any(|d| !d.suppressed)).then(|| {
+    let ok_line = (!diags
+        .iter()
+        .any(|d| !d.suppressed && d.severity == Severity::Error))
+    .then(|| {
         format!(
             "[ci-parity] OK: workspace parity verified in {}",
             ci_cfg.workflow.display()
@@ -192,7 +254,10 @@ fn run_slint_theme_task(
         },
         parallel,
     )?;
-    let ok_line = (!diags.iter().any(|d| !d.suppressed)).then(|| {
+    let ok_line = (!diags
+        .iter()
+        .any(|d| !d.suppressed && d.severity == Severity::Error))
+    .then(|| {
         format!(
             "[slint-theme] OK: all hex colors in {} are mapped or whitelisted",
             ui_dir.display()
@@ -262,12 +327,13 @@ pub fn collect_all_static_checks(
     let emit_text = !opts.format.is_structured();
     let ast_plans = ast_pipeline::build_plans(config, base_dir, opts)?;
 
-    let (fl_res, ci_res, theme_res, ast_results) = if opts.parallel {
+    let (fl_res, ci_res, theme_res, ws_dag_res, ast_results) = if opts.parallel {
         tracing::debug!("running static quality checks with shared AST and file-level parallelism");
         std::thread::scope(|s| {
             let ci_handle = s.spawn(|| run_ci_parity_task(config, base_dir, opts));
             let fl_handle = s.spawn(|| run_file_length_task(config, base_dir, opts, true));
             let theme_handle = s.spawn(|| run_slint_theme_task(config, base_dir, opts, true));
+            let ws_dag_handle = s.spawn(|| run_workspace_dag_task(config, base_dir, opts));
             let ast_results = ast_pipeline::run_shared_ast_tasks(&ast_plans, true);
 
             let join_task = |h: std::thread::ScopedJoinHandle<
@@ -281,6 +347,7 @@ pub fn collect_all_static_checks(
                 join_task(fl_handle),
                 join_task(ci_handle),
                 join_task(theme_handle),
+                join_task(ws_dag_handle),
                 ast_results,
             )
         })
@@ -290,7 +357,8 @@ pub fn collect_all_static_checks(
         let ast_results = ast_pipeline::run_shared_ast_tasks(&ast_plans, false);
         let ci_res = run_ci_parity_task(config, base_dir, opts);
         let theme_res = run_slint_theme_task(config, base_dir, opts, false);
-        (fl_res, ci_res, theme_res, ast_results)
+        let ws_dag_res = run_workspace_dag_task(config, base_dir, opts);
+        (fl_res, ci_res, theme_res, ws_dag_res, ast_results)
     };
 
     let comp_outcome = ast_pipeline::finish_complexity_outcome(
@@ -320,10 +388,16 @@ pub fn collect_all_static_checks(
         fl_res?,
         comp_outcome,
         dag_outcome,
+        ws_dag_res?,
         ci_res?,
         theme_res?,
         i18n_outcome,
     ];
+
+    let warn_unused = config
+        .check
+        .as_ref()
+        .is_none_or(|c| c.warn_unused_suppressions);
 
     let mut diagnostics = Vec::new();
     for outcome in outcomes.into_iter().flatten() {
@@ -331,6 +405,10 @@ pub fn collect_all_static_checks(
             println!("{ok_line}");
         }
         diagnostics.extend(outcome.diagnostics);
+    }
+
+    if !warn_unused {
+        diagnostics.retain(|d| d.rule_id != "warden/unused-suppression");
     }
 
     Ok(diagnostics)
@@ -402,38 +480,69 @@ pub fn emit_report_and_enforce(
             }
             Ok(())
         }
-        OutputFormat::Text => {
-            let inline_suppressed = report
-                .diagnostics
-                .iter()
-                .filter(|d| d.suppressed && d.suppression_reason.as_deref() == Some("inline"))
-                .count();
-            if inline_suppressed > 0 || stats.suppressed > 0 {
-                println!(
-                    "ℹ️  [warden] suppressed {} diagnostic(s) (inline: {}, baseline: {})",
-                    inline_suppressed + stats.suppressed,
-                    inline_suppressed,
-                    stats.suppressed
-                );
+        OutputFormat::GithubActions => {
+            let gha = report.to_github_actions();
+            if !gha.is_empty() {
+                println!("{gha}");
             }
-
-            let active: Vec<&Diagnostic> = report
-                .diagnostics
-                .iter()
-                .filter(|d| !d.suppressed)
-                .collect();
-
-            if active.is_empty() {
-                println!("✨ [warden] all static quality checks passed successfully!");
-                Ok(())
-            } else {
-                println!("❌ [warden] {} violation(s) found:", active.len());
-                for d in &active {
-                    println!("  ❌ [{}] {}", d.check, d.message);
-                }
+            if !report.passed {
                 bail!("{failure_summary}");
             }
+            Ok(())
         }
+        OutputFormat::Text => emit_text_report(report, stats, failure_summary),
+    }
+}
+
+fn emit_text_report(
+    report: &CheckReport,
+    stats: BaselineApplyStats,
+    failure_summary: &str,
+) -> Result<()> {
+    let inline_suppressed = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.suppressed && d.suppression_reason.as_deref() == Some("inline"))
+        .count();
+    if inline_suppressed > 0 || stats.suppressed > 0 {
+        println!(
+            "ℹ️  [warden] suppressed {} diagnostic(s) (inline: {}, baseline: {})",
+            inline_suppressed + stats.suppressed,
+            inline_suppressed,
+            stats.suppressed
+        );
+    }
+    if stats.stale > 0 {
+        println!(
+            "💡 [baseline] {} stale baseline entry(ies) can be removed with `cargo warden baseline prune`",
+            stats.stale
+        );
+    }
+
+    let warnings: Vec<&Diagnostic> = report
+        .diagnostics
+        .iter()
+        .filter(|d| !d.suppressed && d.severity == Severity::Warning)
+        .collect();
+    for w in &warnings {
+        println!("  ⚠️  [{}] {}", w.check, w.message);
+    }
+
+    let errors: Vec<&Diagnostic> = report
+        .diagnostics
+        .iter()
+        .filter(|d| !d.suppressed && d.severity == Severity::Error)
+        .collect();
+
+    if errors.is_empty() {
+        println!("✨ [warden] all static quality checks passed successfully!");
+        Ok(())
+    } else {
+        println!("❌ [warden] {} violation(s) found:", errors.len());
+        for d in &errors {
+            println!("  ❌ [{}] {}", d.check, d.message);
+        }
+        bail!("{failure_summary}");
     }
 }
 
@@ -458,12 +567,13 @@ pub fn run_static_checks_with_options(
     }
 
     let diagnostics = collect_all_static_checks(config, base_dir, opts)?;
-    let (report, stats) = apply_baseline_and_report(
+    let (report, stats) = apply_baseline_and_report_with_scope(
         diagnostics,
         base_dir,
         config,
         opts.baseline_override,
         opts.no_baseline,
+        opts.changeset.is_none(),
     )?;
 
     let summary_err = summarize_failure(&report);
@@ -474,7 +584,7 @@ fn summarize_failure(report: &CheckReport) -> String {
     let active_checks: BTreeSet<&str> = report
         .diagnostics
         .iter()
-        .filter(|d| !d.suppressed)
+        .filter(|d| !d.suppressed && d.severity == Severity::Error)
         .map(|d| d.check.as_str())
         .collect();
 

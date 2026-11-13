@@ -1,6 +1,7 @@
 pub mod baseline;
 pub mod checks;
 pub mod config;
+pub mod doctor;
 pub mod gate;
 pub mod git;
 pub mod hook;

@@ -1,4 +1,4 @@
-//! Structured diagnostic reporting in Text, JSON, and SARIF 2.1.0 formats.
+//! Structured diagnostic reporting in Text, JSON, SARIF 2.1.0, and GitHub Actions formats.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -11,6 +11,7 @@ pub enum OutputFormat {
     Text,
     Json,
     Sarif,
+    GithubActions,
 }
 
 impl OutputFormat {
@@ -187,6 +188,47 @@ impl CheckReport {
 
         Ok(serde_json::to_string_pretty(&sarif)?)
     }
+
+    /// Render active diagnostics as GitHub Actions workflow commands (`::error ...` / `::warning ...`).
+    pub fn to_github_actions(&self) -> String {
+        let mut lines = Vec::new();
+        for d in self.diagnostics.iter().filter(|d| !d.suppressed) {
+            let level = match d.severity {
+                Severity::Error => "error",
+                Severity::Warning => "warning",
+            };
+            let mut props = Vec::new();
+            if let Some(file) = &d.file {
+                let uri = file.to_string_lossy().replace('\\', "/");
+                props.push(format!("file={}", escape_gha_property(&uri)));
+            }
+            if let Some(line) = d.line {
+                props.push(format!("line={}", line.max(1)));
+            }
+            if let Some(col) = d.column {
+                props.push(format!("col={}", col.max(1)));
+            }
+            props.push(format!("title={}", escape_gha_property(&d.rule_id)));
+
+            let prop_str = props.join(",");
+            let msg = escape_gha_data(&d.message);
+            lines.push(format!("::{level} {prop_str}::{msg}"));
+        }
+        lines.join("\n")
+    }
+}
+
+fn escape_gha_data(input: &str) -> String {
+    input
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
+
+fn escape_gha_property(input: &str) -> String {
+    escape_gha_data(input)
+        .replace(':', "%3A")
+        .replace(',', "%2C")
 }
 
 fn rule_short_description(rule_id: &str) -> &'static str {
@@ -194,11 +236,24 @@ fn rule_short_description(rule_id: &str) -> &'static str {
         "warden/dag/cycle" => "Module dependency cycle detected",
         "warden/dag/forbid-import" => "Forbidden module import detected",
         "warden/dag/layer-violation" => "Layered architecture dependency violation",
+        "warden/dag/workspace-cycle" => "Workspace crate dependency cycle detected",
+        "warden/dag/workspace-forbid-dep" => "Forbidden workspace dependency detected",
+        "warden/dag/workspace-layer-violation" => {
+            "Workspace crate layered architecture dependency violation"
+        }
+        "warden/dag/workspace-version-conflict" => {
+            "Multiple versions of an external crate resolved in workspace"
+        }
         "warden/complexity" => "Function cognitive complexity exceeds threshold",
+        "warden/function-length" => "Function line count exceeds threshold",
+        "warden/nesting-depth" => "Function control-flow nesting depth exceeds threshold",
         "warden/file-length" => "File line count exceeds threshold",
         "warden/ci-parity" => "Workspace crate missing from CI test coverage",
         "warden/slint-theme" => "Unmapped hardcoded hex color in Slint UI file",
         "warden/i18n" => "Generated Rust i18n catalog is out of sync with .po files",
+        "warden/unused-suppression" => {
+            "Inline `warden:allow` directive did not match any violation"
+        }
         "warden/gate" => "Verification gate step failed",
         _ => "cargo-warden quality check violation",
     }

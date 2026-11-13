@@ -1,9 +1,9 @@
 //! Baseline snapshot management for gradual adoption and regression prevention.
 
-use crate::report::Diagnostic;
+use crate::report::{Diagnostic, Severity};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -31,8 +31,10 @@ impl BaselineFile {
     pub fn from_diagnostics(diagnostics: &[Diagnostic]) -> Self {
         let mut entries = BTreeMap::new();
         for diag in diagnostics {
-            // Do not record diagnostics already suppressed inline.
-            if diag.suppressed && diag.suppression_reason.as_deref() == Some("inline") {
+            // Do not record diagnostics already suppressed inline or informational warnings.
+            if (diag.suppressed && diag.suppression_reason.as_deref() == Some("inline"))
+                || diag.severity == Severity::Warning
+            {
                 continue;
             }
             entries.insert(
@@ -96,10 +98,59 @@ impl BaselineFile {
         }
         stats
     }
+
+    /// Count baseline entries that are no longer present in a full set of current diagnostics.
+    pub fn stale_count(&self, current_diagnostics: &[Diagnostic]) -> usize {
+        let active_fingerprints = collect_live_fingerprints(current_diagnostics);
+        self.entries
+            .keys()
+            .filter(|fp| !active_fingerprints.contains(*fp))
+            .count()
+    }
+
+    /// Remove stale baseline entries that no longer correspond to any current violation.
+    pub fn prune(&mut self, current_diagnostics: &[Diagnostic]) -> BaselinePruneStats {
+        let total_before = self.entries.len();
+        let live_fingerprints = collect_live_fingerprints(current_diagnostics);
+        let mut removed_keys = Vec::new();
+        self.entries.retain(|fp, _| {
+            let keep = live_fingerprints.contains(fp);
+            if !keep {
+                removed_keys.push(fp.clone());
+            }
+            keep
+        });
+        BaselinePruneStats {
+            total_before,
+            kept: self.entries.len(),
+            removed: removed_keys.len(),
+            removed_keys,
+        }
+    }
+}
+
+fn collect_live_fingerprints(diagnostics: &[Diagnostic]) -> BTreeSet<String> {
+    diagnostics
+        .iter()
+        .filter(|d| {
+            d.severity != Severity::Warning
+                && !(d.suppressed && d.suppression_reason.as_deref() == Some("inline"))
+        })
+        .map(|d| d.fingerprint.clone())
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BaselineApplyStats {
     pub suppressed: usize,
     pub regressions: usize,
+    pub stale: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BaselinePruneStats {
+    pub total_before: usize,
+    pub kept: usize,
+    pub removed: usize,
+    pub removed_keys: Vec<String>,
 }

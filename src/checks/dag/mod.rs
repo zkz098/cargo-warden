@@ -6,11 +6,12 @@
 //! 3. Enforces forbidden import targets and layered architecture boundary rules.
 
 mod layers;
+pub mod workspace;
 
 use super::parallel;
 use crate::config::{DagRuleConfig, LayerConfig};
 use crate::report::{Diagnostic, Severity, normalize_rel_path};
-use crate::suppression::FileSuppressions;
+use crate::suppression::{FileSuppressions, collect_unused_suppression_diagnostics};
 use anyhow::{Result, bail};
 use layers::{check_edge_forbid, check_edge_layers, check_edge_rules};
 use std::collections::{BTreeMap, BTreeSet};
@@ -253,8 +254,8 @@ pub(super) fn top_level(module: &[String]) -> Option<&str> {
 }
 
 pub fn module_graph(src_root: &Path) -> (BTreeSet<String>, BTreeMap<String, BTreeSet<String>>) {
-    let (nodes, edges, _) = collect_detailed_edges(src_root);
-    (nodes, edges)
+    let (scan, _, edges, _) = collect_detailed_edges(src_root);
+    (scan.nodes, edges)
 }
 
 pub fn find_cycles(
@@ -416,13 +417,15 @@ pub(crate) fn assemble_dag_graph<'a>(
     (edges, detailed)
 }
 
-fn collect_detailed_edges(
-    src_root: &Path,
-) -> (
-    BTreeSet<String>,
+type ParsedDagEntries = Vec<Option<(ParsedDagFile, FileSuppressions)>>;
+type DetailedDagEdges = (
+    DagFileScan,
+    ParsedDagEntries,
     BTreeMap<String, BTreeSet<String>>,
     Vec<DetailedEdge>,
-) {
+);
+
+fn collect_detailed_edges(src_root: &Path) -> DetailedDagEdges {
     let scan = scan_dag_files(src_root);
     let parsed: Vec<Option<(ParsedDagFile, FileSuppressions)>> =
         parallel::map_items(&scan.files, true, |file| {
@@ -448,7 +451,62 @@ fn collect_detailed_edges(
         .map(|opt| opt.as_ref().map(|(d, s)| (d, s)))
         .collect();
     let (edges, detailed) = assemble_dag_graph(&scan, &refs);
-    (scan.nodes, edges, detailed)
+    (scan, parsed, edges, detailed)
+}
+
+pub(crate) fn collect_unused_dag_suppressions(
+    base_dir: &Path,
+    scan: &DagFileScan,
+    parsed: &[Option<(&ParsedDagFile, &FileSuppressions)>],
+    detailed_edges: &[DetailedEdge],
+    diagnostics: &[Diagnostic],
+) -> Vec<Diagnostic> {
+    // Treat `// warden:allow(dag)` as used if it suppressed a forbid/layer diagnostic OR suppressed a cross-module edge.
+    let mut augmented: Vec<Diagnostic> = diagnostics.to_vec();
+    for edge in detailed_edges {
+        if !edge.suppressed {
+            continue;
+        }
+        let Some(from_top) = top_level(&edge.from_mod) else {
+            continue;
+        };
+        let Some(to_top) = top_level(&edge.to_mod) else {
+            continue;
+        };
+        if from_top != to_top {
+            augmented.push(Diagnostic {
+                rule_id: "warden/dag/cycle".to_string(),
+                check: "dag".to_string(),
+                severity: Severity::Error,
+                message: String::new(),
+                file: Some(normalize_rel_path(base_dir, &edge.file)),
+                line: Some(edge.line),
+                column: None,
+                fingerprint: String::new(),
+                metric_value: None,
+                suppressed: true,
+                suppression_reason: Some("inline".to_string()),
+            });
+        }
+    }
+
+    let mut unused = Vec::new();
+    for (file, maybe_parsed) in scan.files.iter().zip(parsed.iter()) {
+        let Some((_, suppressions)) = maybe_parsed else {
+            continue;
+        };
+        if suppressions.directives.is_empty() {
+            continue;
+        }
+        let rel = normalize_rel_path(base_dir, &file.path);
+        unused.extend(collect_unused_suppression_diagnostics(
+            &rel,
+            suppressions,
+            &["dag"],
+            &augmented,
+        ));
+    }
+    unused
 }
 
 fn root_has_changed_rs(src_root: &Path, base_dir: &Path, changeset: &BTreeSet<PathBuf>) -> bool {
@@ -572,14 +630,20 @@ pub fn collect_dag(src_root: &Path, opts: &DagOptions<'_>) -> Result<Vec<Diagnos
         "starting module dependency DAG analysis"
     );
 
-    let (nodes, edges, detailed_edges) = collect_detailed_edges(src_root);
-    Ok(build_dag_diagnostics(
-        src_root,
-        &nodes,
-        &edges,
+    let (scan, parsed, edges, detailed_edges) = collect_detailed_edges(src_root);
+    let mut diags = build_dag_diagnostics(src_root, &scan.nodes, &edges, &detailed_edges, opts);
+    let refs: Vec<Option<(&ParsedDagFile, &FileSuppressions)>> = parsed
+        .iter()
+        .map(|opt| opt.as_ref().map(|(d, s)| (d, s)))
+        .collect();
+    diags.extend(collect_unused_dag_suppressions(
+        opts.base_dir,
+        &scan,
+        &refs,
         &detailed_edges,
-        opts,
-    ))
+        &diags,
+    ));
+    Ok(diags)
 }
 
 pub fn check_dag(src_root: &Path, forbid_imports: &[String]) -> Result<()> {

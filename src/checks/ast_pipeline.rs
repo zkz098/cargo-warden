@@ -1,13 +1,13 @@
 //! Shared Rust AST parsing and per-file parallel pipeline for `collect_all_static_checks`.
 
-use super::complexity::{self, ComplexityOptions, ComplexityReport};
+use super::complexity::{self, ComplexityOptions, ComplexityPolicy, ComplexityReport};
 use super::dag::{self, DagFileScan, DagOptions, ParsedDagFile};
 use super::i18n_po::{self, I18nOptions};
 use super::i18n_source::{self, I18nSourceFile, I18nSourceKind, SourceTranslationKey};
 use super::parallel;
 use super::{CheckTaskOutcome, StaticRunOptions, join_paths};
 use crate::config::WardenConfig;
-use crate::report::normalize_rel_path;
+use crate::report::{Severity, normalize_rel_path};
 use crate::suppression::FileSuppressions;
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
@@ -353,6 +353,11 @@ pub(crate) fn finish_complexity_outcome(
         changeset: opts.changeset,
         emit_text: false,
     };
+    let policy = ComplexityPolicy {
+        max_function_lines: comp_cfg.max_function_lines,
+        max_nesting: comp_cfg.max_nesting,
+        overrides: &comp_cfg.overrides,
+    };
 
     let mut report_count = 0usize;
     let mut files_scanned = 0usize;
@@ -366,15 +371,19 @@ pub(crate) fn finish_complexity_outcome(
         };
         files_scanned += 1;
         report_count += file_reports.len();
-        diags.extend(complexity::build_complexity_diagnostics(
+        diags.extend(complexity::build_complexity_diagnostics_with_policy(
             &tasks[idx].path,
             file_reports,
             suppressions,
             &comp_opts,
+            &policy,
         ));
     }
 
-    let ok_line = (!diags.iter().any(|d| !d.suppressed)).then(|| {
+    let ok_line = (!diags
+        .iter()
+        .any(|d| !d.suppressed && d.severity == Severity::Error))
+    .then(|| {
         format!(
             "[complexity] OK: scanned {} functions across {} files, all within limit ({})",
             report_count, files_scanned, plan.max_complexity
@@ -416,17 +425,28 @@ pub(crate) fn finish_dag_outcome(
             })
             .collect();
         let (edges, detailed) = dag::assemble_dag_graph(&root_plan.scan, &per_file);
-        dag_diags.extend(dag::build_dag_diagnostics(
+        let root_diags = dag::build_dag_diagnostics(
             &root_plan.src_root,
             &root_plan.scan.nodes,
             &edges,
             &detailed,
             &dag_opts,
-        ));
+        );
+        let unused = dag::collect_unused_dag_suppressions(
+            base_dir,
+            &root_plan.scan,
+            &per_file,
+            &detailed,
+            &root_diags,
+        );
+        dag_diags.extend(root_diags);
+        dag_diags.extend(unused);
     }
 
-    let ok_line = (!dag_diags.iter().any(|d| !d.suppressed))
-        .then(|| "[dag] OK: dependencies form a clean DAG with 0 cycle(s)".to_string());
+    let ok_line = (!dag_diags
+        .iter()
+        .any(|d| !d.suppressed && d.severity == Severity::Error))
+    .then(|| "[dag] OK: dependencies form a clean DAG with 0 cycle(s)".to_string());
     Some(CheckTaskOutcome {
         diagnostics: dag_diags,
         ok_line,
@@ -578,12 +598,12 @@ pub fn complex(x: i32) -> i32 {
                 ignore_tests: true,
                 ignore: vec!["target".to_string()],
                 respect_gitignore: false,
+                ..Default::default()
             }),
             dag: Some(DagConfig {
                 roots: vec![PathBuf::from("src")],
                 forbid_imports: vec!["a".to_string()],
-                layers: Vec::new(),
-                rules: Vec::new(),
+                ..Default::default()
             }),
             file_length: Some(FileLengthConfig {
                 max_lines: 100,
@@ -592,6 +612,7 @@ pub fn complex(x: i32) -> i32 {
                 ignore: Vec::new(),
                 mode: Default::default(),
                 respect_gitignore: false,
+                ..Default::default()
             }),
             i18n: Some(I18nConfig {
                 lang_dir: PathBuf::from("lang"),
