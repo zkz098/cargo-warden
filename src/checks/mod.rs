@@ -4,8 +4,10 @@ pub mod ci_parity;
 pub mod complexity;
 pub mod dag;
 pub mod file_length;
+pub mod hygiene;
 pub mod i18n_po;
 pub mod i18n_source;
+pub mod manifest;
 mod parallel;
 pub mod slint_theme;
 
@@ -248,6 +250,7 @@ fn run_actions_task(
             workflows: &actions_cfg.workflows,
             ignore: &actions_cfg.ignore,
             strict: actions_cfg.strict,
+            require_sha_pin: actions_cfg.require_sha_pin,
             offline: false,
             changeset: opts.changeset,
             emit_text: false,
@@ -257,6 +260,30 @@ fn run_actions_task(
     let ok_line = diags
         .is_empty()
         .then(|| "[actions] OK: all GitHub Actions references are up to date".to_string());
+    Ok(Some(CheckTaskOutcome {
+        diagnostics: diags,
+        ok_line,
+    }))
+}
+
+fn run_manifest_task(
+    config: &WardenConfig,
+    base_dir: &Path,
+    opts: &StaticRunOptions<'_>,
+) -> Result<Option<CheckTaskOutcome>> {
+    let Some(manifest_cfg) = &config.manifest else {
+        return Ok(None);
+    };
+    let diags = manifest::collect_manifest(&manifest::ManifestOptions {
+        base_dir,
+        config: manifest_cfg,
+        changeset: opts.changeset,
+        emit_text: false,
+    })?;
+    let ok_line = (!diags
+        .iter()
+        .any(|d| !d.suppressed && d.severity == Severity::Error))
+    .then(|| "[manifest] OK: workspace manifests satisfy all consistency rules".to_string());
     Ok(Some(CheckTaskOutcome {
         diagnostics: diags,
         ok_line,
@@ -366,8 +393,11 @@ pub fn collect_all_static_checks(
 ) -> Result<Vec<Diagnostic>> {
     let emit_text = !opts.format.is_structured();
     let ast_plans = ast_pipeline::build_plans(config, base_dir, opts)?;
+    let hygiene_ignore_tests = config.hygiene.as_ref().is_none_or(|h| h.ignore_tests);
 
-    let (fl_res, ci_res, actions_res, theme_res, ws_dag_res, ast_results) = if opts.parallel {
+    let (fl_res, ci_res, actions_res, theme_res, ws_dag_res, manifest_res, ast_results) = if opts
+        .parallel
+    {
         tracing::debug!("running static quality checks with shared AST and file-level parallelism");
         std::thread::scope(|s| {
             let ci_handle = s.spawn(|| run_ci_parity_task(config, base_dir, opts));
@@ -375,7 +405,9 @@ pub fn collect_all_static_checks(
             let fl_handle = s.spawn(|| run_file_length_task(config, base_dir, opts, true));
             let theme_handle = s.spawn(|| run_slint_theme_task(config, base_dir, opts, true));
             let ws_dag_handle = s.spawn(|| run_workspace_dag_task(config, base_dir, opts));
-            let ast_results = ast_pipeline::run_shared_ast_tasks(&ast_plans, true);
+            let manifest_handle = s.spawn(|| run_manifest_task(config, base_dir, opts));
+            let ast_results =
+                ast_pipeline::run_shared_ast_tasks(&ast_plans, hygiene_ignore_tests, true);
 
             let join_task = |h: std::thread::ScopedJoinHandle<
                 '_,
@@ -390,23 +422,27 @@ pub fn collect_all_static_checks(
                 join_task(actions_handle),
                 join_task(theme_handle),
                 join_task(ws_dag_handle),
+                join_task(manifest_handle),
                 ast_results,
             )
         })
     } else {
         tracing::debug!("running static quality checks sequentially with shared AST");
         let fl_res = run_file_length_task(config, base_dir, opts, false);
-        let ast_results = ast_pipeline::run_shared_ast_tasks(&ast_plans, false);
+        let ast_results =
+            ast_pipeline::run_shared_ast_tasks(&ast_plans, hygiene_ignore_tests, false);
         let ci_res = run_ci_parity_task(config, base_dir, opts);
         let actions_res = run_actions_task(config, base_dir, opts);
         let theme_res = run_slint_theme_task(config, base_dir, opts, false);
         let ws_dag_res = run_workspace_dag_task(config, base_dir, opts);
+        let manifest_res = run_manifest_task(config, base_dir, opts);
         (
             fl_res,
             ci_res,
             actions_res,
             theme_res,
             ws_dag_res,
+            manifest_res,
             ast_results,
         )
     };
@@ -416,6 +452,13 @@ pub fn collect_all_static_checks(
         config,
         base_dir,
         opts,
+        &ast_plans.tasks,
+        &ast_results,
+    );
+    let hygiene_outcome = ast_pipeline::finish_hygiene_outcome(
+        ast_plans.hygiene.as_ref(),
+        config,
+        base_dir,
         &ast_plans.tasks,
         &ast_results,
     );
@@ -437,8 +480,10 @@ pub fn collect_all_static_checks(
     let outcomes = [
         fl_res?,
         comp_outcome,
+        hygiene_outcome,
         dag_outcome,
         ws_dag_res?,
+        manifest_res?,
         ci_res?,
         actions_res?,
         theme_res?,
@@ -504,6 +549,27 @@ pub fn run_static_fixes(config: &WardenConfig, base_dir: &Path, emit_text: bool)
                 &base_dir.join(&i18n_cfg.out_file),
             )?;
         }
+    }
+
+    if let Some(actions_cfg) = &config.actions
+        && actions_cfg.enabled_in_check
+    {
+        let parallel = config.check.as_ref().is_none_or(|c| c.parallel);
+        actions::fix_actions(
+            base_dir,
+            &actions::ActionsOptions {
+                workflows: &actions_cfg.workflows,
+                ignore: &actions_cfg.ignore,
+                strict: actions_cfg.strict,
+                require_sha_pin: actions_cfg.require_sha_pin,
+                offline: false,
+                changeset: None,
+                emit_text,
+                parallel,
+            },
+            true,
+            actions_cfg.require_sha_pin,
+        )?;
     }
 
     Ok(())

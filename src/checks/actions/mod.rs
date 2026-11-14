@@ -4,6 +4,9 @@
 //! references, queries remote Git tags via `git ls-remote --tags`, and reports outdated action
 //! references.
 
+mod fix;
+pub use fix::{ActionsFixStats, fix_actions, fix_actions_with_fetcher};
+
 use crate::checks::parallel;
 use crate::report::{Diagnostic, Severity, normalize_rel_path};
 use anyhow::{Context, Result};
@@ -20,8 +23,10 @@ pub struct ActionsOptions<'a> {
     pub workflows: &'a [PathBuf],
     /// Action repositories or patterns to ignore (e.g. `actions/checkout`, `owner/*`).
     pub ignore: &'a [String],
-    /// Emit `Severity::Error` instead of `Severity::Warning` for outdated actions.
+    /// Emit `Severity::Error` instead of `Severity::Warning` for outdated/unpinned actions.
     pub strict: bool,
+    /// Require `uses:` references to be pinned to a 40-character commit SHA.
+    pub require_sha_pin: bool,
     /// Skip remote `git ls-remote` queries (only scan/parse local workflow files).
     pub offline: bool,
     /// Optional git changeset filter (`--staged` / `--diff`).
@@ -499,6 +504,30 @@ fn evaluate_action_against_tags(
     None
 }
 
+fn make_unpinned_sha_diagnostic(action: &ActionReference, severity: Severity) -> Diagnostic {
+    let rel_str = action.file.to_string_lossy().replace('\\', "/");
+    let full_name = action.full_action_name();
+    Diagnostic {
+        rule_id: "warden/actions/unpinned-sha".to_string(),
+        check: "actions".to_string(),
+        severity,
+        message: format!(
+            "{}:{}: action `{}` uses `{}` which is not pinned to a 40-character commit SHA",
+            rel_str, action.line, full_name, action.git_ref
+        ),
+        file: Some(action.file.clone()),
+        line: Some(action.line),
+        column: None,
+        fingerprint: format!(
+            "actions:unpinned-sha:{}:{}:{}:{}",
+            rel_str, action.line, full_name, action.git_ref
+        ),
+        metric_value: None,
+        suppressed: false,
+        suppression_reason: None,
+    }
+}
+
 fn make_outdated_diagnostic(
     action: &ActionReference,
     current_label: &str,
@@ -570,6 +599,7 @@ pub fn collect_actions_from_config(
     workflow: &[PathBuf],
     ignore: &[String],
     strict: bool,
+    require_sha_pin: bool,
     offline: bool,
     changeset: Option<&BTreeSet<PathBuf>>,
     emit_text: bool,
@@ -593,12 +623,56 @@ pub fn collect_actions_from_config(
             workflows,
             ignore: ignored,
             strict: strict || cfg.strict,
+            require_sha_pin: require_sha_pin || cfg.require_sha_pin,
             offline,
             changeset,
             emit_text,
             parallel,
         },
     )
+}
+
+pub(super) fn scan_filtered_workflow_refs(
+    base_dir: &Path,
+    opts: &ActionsOptions<'_>,
+) -> Result<(usize, Vec<ActionReference>)> {
+    let workflow_files = discover_workflow_files(base_dir, opts.workflows);
+    let mut refs = Vec::new();
+    for wf in &workflow_files {
+        let rel = normalize_rel_path(base_dir, wf);
+        if !should_include_file_in_changeset(&rel, opts.changeset) {
+            continue;
+        }
+        let file_refs = scan_workflow_file(base_dir, wf)?;
+        refs.extend(
+            file_refs
+                .into_iter()
+                .filter(|r| !should_ignore_action(r, opts.ignore)),
+        );
+    }
+    Ok((workflow_files.len(), refs))
+}
+
+fn collect_offline_diagnostics(
+    workflow_count: usize,
+    refs: &[ActionReference],
+    opts: &ActionsOptions<'_>,
+    severity: Severity,
+) -> Vec<Diagnostic> {
+    if opts.emit_text && opts.offline {
+        println!(
+            "ℹ️  [actions] scanned {} workflow file(s), found {} action reference(s) (offline mode)",
+            workflow_count,
+            refs.len()
+        );
+    }
+    if !opts.require_sha_pin {
+        return Vec::new();
+    }
+    refs.iter()
+        .filter(|r| !is_sha40(&r.git_ref))
+        .map(|r| make_unpinned_sha_diagnostic(r, severity))
+        .collect()
 }
 
 /// Collect diagnostics using a custom tag-fetcher (primarily for offline/mocked testing).
@@ -610,30 +684,20 @@ pub fn collect_actions_with_fetcher<F>(
 where
     F: Fn(&str) -> Result<Vec<RemoteTagInfo>> + Sync,
 {
-    let workflow_files = discover_workflow_files(base_dir, opts.workflows);
-    let mut refs = Vec::new();
-    for wf in &workflow_files {
-        let rel = normalize_rel_path(base_dir, wf);
-        if !should_include_file_in_changeset(&rel, opts.changeset) {
-            continue;
-        }
-        let file_refs = scan_workflow_file(base_dir, wf)?;
-        for r in file_refs {
-            if !should_ignore_action(&r, opts.ignore) {
-                refs.push(r);
-            }
-        }
-    }
+    let (workflow_count, refs) = scan_filtered_workflow_refs(base_dir, opts)?;
+    let severity = if opts.strict {
+        Severity::Error
+    } else {
+        Severity::Warning
+    };
 
     if refs.is_empty() || opts.offline {
-        if opts.emit_text && opts.offline {
-            println!(
-                "ℹ️  [actions] scanned {} workflow file(s), found {} action reference(s) (offline mode)",
-                workflow_files.len(),
-                refs.len()
-            );
-        }
-        return Ok(Vec::new());
+        return Ok(collect_offline_diagnostics(
+            workflow_count,
+            &refs,
+            opts,
+            severity,
+        ));
     }
 
     let unique_repos: Vec<String> = refs
@@ -656,15 +720,12 @@ where
     });
     let repo_map: BTreeMap<String, Result<Vec<RemoteTagInfo>>> = fetched.into_iter().collect();
 
-    let severity = if opts.strict {
-        Severity::Error
-    } else {
-        Severity::Warning
-    };
-
     let mut diagnostics = Vec::new();
     let mut reported_fetch_err = BTreeSet::new();
     for r in &refs {
+        if opts.require_sha_pin && !is_sha40(&r.git_ref) {
+            diagnostics.push(make_unpinned_sha_diagnostic(r, severity));
+        }
         let slug = r.repo_slug();
         match repo_map.get(&slug) {
             Some(Ok(tags)) => {

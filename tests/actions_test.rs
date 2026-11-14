@@ -193,6 +193,7 @@ jobs:
             workflows: &[],
             ignore: &ignore,
             strict: true,
+            require_sha_pin: false,
             offline: false,
             changeset: None,
             emit_text: false,
@@ -228,6 +229,7 @@ jobs:
             workflows: &[],
             ignore: &ignore,
             strict: true,
+            require_sha_pin: false,
             offline: true,
             changeset: None,
             emit_text: false,
@@ -247,6 +249,7 @@ jobs:
             workflows: &[],
             ignore: &ignore,
             strict: false,
+            require_sha_pin: false,
             offline: false,
             changeset: Some(&cs),
             emit_text: false,
@@ -325,4 +328,144 @@ fn test_cli_actions_offline_json() {
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(json["passed"], true);
     assert_eq!(json["summary"]["total"], 0);
+}
+
+#[test]
+fn test_actions_require_sha_and_fix_pin_sha() {
+    use cargo_warden::checks::actions::fix_actions_with_fetcher;
+
+    let dir = tempfile::tempdir().unwrap();
+    let wf_dir = dir.path().join(".github/workflows");
+    fs::create_dir_all(&wf_dir).unwrap();
+    let wf_path = wf_dir.join("ci.yml");
+
+    let initial = "\
+jobs:
+  build:
+    steps:
+      - uses: actions/checkout@v3
+      - uses: \"actions/cache@v4.1.0\"
+      - uses: Swatinem/rust-cache@1111111111111111111111111111111111111111 # v2.7.0
+";
+    fs::write(&wf_path, initial).unwrap();
+
+    let fetcher = |slug: &str| -> anyhow::Result<Vec<RemoteTagInfo>> {
+        match slug {
+            "actions/checkout" => Ok(vec![
+                RemoteTagInfo {
+                    tag: "v3".to_string(),
+                    sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                },
+                RemoteTagInfo {
+                    tag: "v4".to_string(),
+                    sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                },
+                RemoteTagInfo {
+                    tag: "v4.2.2".to_string(),
+                    sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                },
+            ]),
+            "actions/cache" => Ok(vec![
+                RemoteTagInfo {
+                    tag: "v4.1.0".to_string(),
+                    sha: "cccccccccccccccccccccccccccccccccccccccc".to_string(),
+                },
+                RemoteTagInfo {
+                    tag: "v4.2.0".to_string(),
+                    sha: "dddddddddddddddddddddddddddddddddddddddd".to_string(),
+                },
+            ]),
+            "Swatinem/rust-cache" => Ok(vec![
+                RemoteTagInfo {
+                    tag: "v2.7.0".to_string(),
+                    sha: "1111111111111111111111111111111111111111".to_string(),
+                },
+                RemoteTagInfo {
+                    tag: "v2.7.5".to_string(),
+                    sha: "2222222222222222222222222222222222222222".to_string(),
+                },
+            ]),
+            other => panic!("unexpected repo query: {other}"),
+        }
+    };
+
+    // 1. require_sha_pin detects unpinned refs even offline
+    let offline_unpinned = collect_actions_with_fetcher(
+        dir.path(),
+        &ActionsOptions {
+            workflows: &[],
+            ignore: &[],
+            strict: true,
+            require_sha_pin: true,
+            offline: true,
+            changeset: None,
+            emit_text: false,
+            parallel: false,
+        },
+        fetcher,
+    )
+    .unwrap();
+    assert_eq!(offline_unpinned.len(), 2);
+    assert!(
+        offline_unpinned
+            .iter()
+            .all(|d| d.rule_id == "warden/actions/unpinned-sha")
+    );
+
+    // 2. fix + pin_sha upgrades and pins all 3 refs
+    let stats = fix_actions_with_fetcher(
+        dir.path(),
+        &ActionsOptions {
+            workflows: &[],
+            ignore: &[],
+            strict: false,
+            require_sha_pin: true,
+            offline: false,
+            changeset: None,
+            emit_text: false,
+            parallel: false,
+        },
+        true,
+        true,
+        fetcher,
+    )
+    .unwrap();
+    assert_eq!(stats.files_updated, 1);
+    assert_eq!(stats.refs_updated, 3);
+
+    let updated = fs::read_to_string(&wf_path).unwrap();
+    assert!(
+        updated
+            .contains("uses: actions/checkout@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb # v4.2.2"),
+        "actual:\n{updated}"
+    );
+    assert!(
+        updated
+            .contains("uses: \"actions/cache@dddddddddddddddddddddddddddddddddddddddd\" # v4.2.0"),
+        "actual:\n{updated}"
+    );
+    assert!(
+        updated.contains(
+            "uses: Swatinem/rust-cache@2222222222222222222222222222222222222222 # v2.7.5"
+        ),
+        "actual:\n{updated}"
+    );
+
+    // 3. Re-checking with require_sha_pin passes with 0 diagnostics
+    let after = collect_actions_with_fetcher(
+        dir.path(),
+        &ActionsOptions {
+            workflows: &[],
+            ignore: &[],
+            strict: true,
+            require_sha_pin: true,
+            offline: false,
+            changeset: None,
+            emit_text: false,
+            parallel: false,
+        },
+        fetcher,
+    )
+    .unwrap();
+    assert!(after.is_empty(), "unexpected diagnostics: {after:#?}");
 }

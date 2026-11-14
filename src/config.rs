@@ -15,6 +15,8 @@ pub struct WardenConfig {
     pub i18n: Option<I18nConfig>,
     pub complexity: Option<ComplexityConfig>,
     pub file_length: Option<FileLengthConfig>,
+    pub hygiene: Option<HygieneConfig>,
+    pub manifest: Option<ManifestConfig>,
     pub check: Option<CheckConfig>,
     pub gate: Option<GateConfig>,
 }
@@ -189,6 +191,8 @@ pub struct ActionsConfig {
     pub ignore: Vec<String>,
     /// Emit errors instead of warnings when outdated actions are found (default: false)
     pub strict: bool,
+    /// Require `uses:` references to be pinned to a 40-character commit SHA (default: false)
+    pub require_sha_pin: bool,
     /// Include GitHub Actions update check in `cargo warden check` (default: false)
     pub enabled_in_check: bool,
 }
@@ -199,6 +203,7 @@ impl Default for ActionsConfig {
             workflows: vec![PathBuf::from(".github/workflows")],
             ignore: Vec::new(),
             strict: false,
+            require_sha_pin: false,
             enabled_in_check: false,
         }
     }
@@ -355,6 +360,8 @@ pub struct ComplexityOverride {
     pub max_function_lines: Option<usize>,
     /// Override maximum allowed control-flow nesting depth
     pub max_nesting: Option<usize>,
+    /// Override maximum allowed function parameter count
+    pub max_params: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,6 +373,8 @@ pub struct ComplexityConfig {
     pub max_function_lines: Option<usize>,
     /// Optional maximum allowed nesting depth per function/method
     pub max_nesting: Option<usize>,
+    /// Optional maximum allowed parameter count per function/method
+    pub max_params: Option<usize>,
     /// Roots/paths to scan (default: ["."])
     pub paths: Vec<PathBuf>,
     /// Exclude test files (*_test.rs, tests.rs, tests/ directory)
@@ -385,6 +394,7 @@ impl Default for ComplexityConfig {
             max: 20,
             max_function_lines: None,
             max_nesting: None,
+            max_params: None,
             paths: vec![PathBuf::from(".")],
             ignore_tests: true,
             ignore: vec!["target".to_string()],
@@ -453,6 +463,112 @@ impl Default for FileLengthConfig {
 
 fn default_true() -> bool {
     true
+}
+
+/// Path-scoped rule overrides for `hygiene`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct HygieneOverride {
+    /// Relative path prefixes or glob patterns (e.g. `src/bin/**`, `crates/cli/**`)
+    pub paths: Vec<String>,
+    pub forbid_unsafe: Option<bool>,
+    pub require_safety_comment: Option<bool>,
+    pub forbid_unwrap: Option<bool>,
+    pub forbid_expect: Option<bool>,
+    pub forbid_dbg: Option<bool>,
+    pub forbid_todo: Option<bool>,
+    pub forbid_println: Option<bool>,
+}
+
+/// Rust production code hygiene and safety guard configuration (`[hygiene]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HygieneConfig {
+    /// Roots/paths to scan (default: ["."])
+    pub paths: Vec<PathBuf>,
+    /// Exclude test files (*_test.rs, tests.rs, tests/ directory) and `#[test]` / `#[cfg(test)]` items
+    #[serde(default = "default_true")]
+    pub ignore_tests: bool,
+    /// File patterns or paths to ignore (supports glob patterns)
+    pub ignore: Vec<String>,
+    /// Respect `.gitignore` rules while scanning
+    #[serde(default = "default_true")]
+    pub respect_gitignore: bool,
+    /// Forbid all `unsafe` blocks, functions, traits, and impls
+    pub forbid_unsafe: bool,
+    /// Require a `// SAFETY:` comment above or inside `unsafe` blocks/items (default: true)
+    #[serde(default = "default_true")]
+    pub require_safety_comment: bool,
+    /// Forbid `.unwrap()` / `.unwrap_err()` calls in non-test code (default: true)
+    #[serde(default = "default_true")]
+    pub forbid_unwrap: bool,
+    /// Forbid `.expect()` / `.expect_err()` calls in non-test code (default: false)
+    pub forbid_expect: bool,
+    /// Forbid `dbg!(...)` macro calls in non-test code (default: true)
+    #[serde(default = "default_true")]
+    pub forbid_dbg: bool,
+    /// Forbid `todo!(...)` and `unimplemented!(...)` macro calls (default: true)
+    #[serde(default = "default_true")]
+    pub forbid_todo: bool,
+    /// Forbid `println!` / `eprintln!` / `print!` / `eprint!` in non-test code (default: false)
+    pub forbid_println: bool,
+    /// Path-scoped rule overrides (evaluated in order; last match wins)
+    pub overrides: Vec<HygieneOverride>,
+}
+
+impl Default for HygieneConfig {
+    fn default() -> Self {
+        Self {
+            paths: vec![PathBuf::from(".")],
+            ignore_tests: true,
+            ignore: vec!["target".to_string()],
+            respect_gitignore: true,
+            forbid_unsafe: false,
+            require_safety_comment: true,
+            forbid_unwrap: true,
+            forbid_expect: false,
+            forbid_dbg: true,
+            forbid_todo: true,
+            forbid_println: false,
+            overrides: Vec::new(),
+        }
+    }
+}
+
+/// Cargo workspace manifest consistency guard configuration (`[manifest]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ManifestConfig {
+    /// `[package]` fields that must use `{ workspace = true }` when defined in `[workspace.package]`
+    pub inherit_fields: Vec<String>,
+    /// Require member dependencies also present in `[workspace.dependencies]` to use `workspace = true`
+    #[serde(default = "default_true")]
+    pub enforce_workspace_deps: bool,
+    /// Forbid `git = "..."` dependencies in member manifests
+    #[serde(default = "default_true")]
+    pub forbid_git_deps: bool,
+    /// Forbid `path = "..."` dependencies pointing outside the workspace root
+    pub forbid_external_path_deps: bool,
+    /// Dependency names exempted from `forbid_git_deps`
+    pub allow_git_deps: Vec<String>,
+    /// Workspace member crate names to skip
+    pub ignore_crates: Vec<String>,
+    /// Verify `#[cfg(feature = "...")]` / `cfg!(feature = "...")` names against `[features]`
+    pub check_features: bool,
+}
+
+impl Default for ManifestConfig {
+    fn default() -> Self {
+        Self {
+            inherit_fields: vec!["edition".to_string(), "license".to_string()],
+            enforce_workspace_deps: true,
+            forbid_git_deps: true,
+            forbid_external_path_deps: false,
+            allow_git_deps: Vec::new(),
+            ignore_crates: Vec::new(),
+            check_features: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

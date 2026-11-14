@@ -211,14 +211,28 @@ fn rule_matches_diagnostic(rule: &str, diag_rule_id: &str) -> bool {
         "all" | "*" => true,
         "complexity" => matches!(
             diag_rule_id,
-            "warden/complexity" | "warden/function-length" | "warden/nesting-depth"
+            "warden/complexity"
+                | "warden/function-length"
+                | "warden/nesting-depth"
+                | "warden/function-params"
         ),
         "function-length" => diag_rule_id == "warden/function-length",
         "nesting-depth" => diag_rule_id == "warden/nesting-depth",
+        "function-params" => diag_rule_id == "warden/function-params",
         "file-length" => diag_rule_id == "warden/file-length",
         "slint-theme" => diag_rule_id == "warden/slint-theme",
         "dag" => diag_rule_id.starts_with("warden/dag/"),
         "workspace-dag" => diag_rule_id.starts_with("warden/dag/workspace-"),
+        "hygiene" => diag_rule_id.starts_with("warden/hygiene/"),
+        "unsafe" => matches!(
+            diag_rule_id,
+            "warden/hygiene/forbid-unsafe" | "warden/hygiene/unsafe-without-safety"
+        ),
+        "safety" => diag_rule_id == "warden/hygiene/unsafe-without-safety",
+        "unwrap" | "expect" | "dbg" | "todo" | "println" => {
+            diag_rule_id == format!("warden/hygiene/{rule}")
+        }
+        "manifest" => diag_rule_id.starts_with("warden/manifest/"),
         other => diag_rule_id == format!("warden/{other}") || diag_rule_id == other,
     }
 }

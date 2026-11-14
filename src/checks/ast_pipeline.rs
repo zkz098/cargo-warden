@@ -2,6 +2,7 @@
 
 use super::complexity::{self, ComplexityOptions, ComplexityPolicy, ComplexityReport};
 use super::dag::{self, DagFileScan, DagOptions, ParsedDagFile};
+use super::hygiene::{self, HygieneFinding, HygieneOptions};
 use super::i18n_po::{self, I18nOptions};
 use super::i18n_source::{self, I18nSourceFile, I18nSourceKind, SourceTranslationKey};
 use super::parallel;
@@ -19,6 +20,7 @@ enum TaskRole {
     Complexity,
     Dag,
     I18n,
+    Hygiene,
 }
 
 #[derive(Debug, Clone)]
@@ -27,6 +29,7 @@ pub(crate) struct SharedRustTask {
     want_complexity: bool,
     want_dag: bool,
     want_i18n: bool,
+    want_hygiene: bool,
 }
 
 #[derive(Default)]
@@ -45,6 +48,7 @@ impl TaskRegistry {
                 want_complexity: false,
                 want_dag: false,
                 want_i18n: false,
+                want_hygiene: false,
             });
             new_idx
         });
@@ -53,6 +57,7 @@ impl TaskRegistry {
             TaskRole::Complexity => task.want_complexity = true,
             TaskRole::Dag => task.want_dag = true,
             TaskRole::I18n => task.want_i18n = true,
+            TaskRole::Hygiene => task.want_hygiene = true,
         }
         idx
     }
@@ -88,10 +93,15 @@ pub(crate) struct I18nPlan {
     macro_names: Vec<String>,
 }
 
+pub(crate) struct HygienePlan {
+    task_indices: Vec<usize>,
+}
+
 pub(crate) struct AstCheckPlans {
     pub(crate) complexity: Option<ComplexityPlan>,
     pub(crate) dag_roots: Option<Vec<DagRootPlan>>,
     pub(crate) i18n: Option<I18nPlan>,
+    pub(crate) hygiene: Option<HygienePlan>,
     pub(crate) tasks: Vec<SharedRustTask>,
 }
 
@@ -101,6 +111,7 @@ pub(crate) struct SharedRustResult {
     dag_imports: Option<ParsedDagFile>,
     i18n_keys: Option<Vec<SourceTranslationKey>>,
     i18n_read_error: Option<String>,
+    hygiene_findings: Option<Vec<HygieneFinding>>,
 }
 
 pub(crate) fn build_plans(
@@ -112,13 +123,37 @@ pub(crate) fn build_plans(
     let complexity = plan_complexity(config, base_dir, opts, &mut registry);
     let dag_roots = plan_dag(config, base_dir, opts, &mut registry)?;
     let i18n = plan_i18n(config, base_dir, opts, &mut registry);
+    let hygiene = plan_hygiene(config, base_dir, opts, &mut registry);
 
     Ok(AstCheckPlans {
         complexity,
         dag_roots,
         i18n,
+        hygiene,
         tasks: registry.tasks,
     })
+}
+
+fn plan_hygiene(
+    config: &WardenConfig,
+    base_dir: &Path,
+    opts: &StaticRunOptions<'_>,
+    registry: &mut TaskRegistry,
+) -> Option<HygienePlan> {
+    let hyg_cfg = config.hygiene.as_ref()?;
+    let search_paths = join_paths(base_dir, &hyg_cfg.paths);
+    let hyg_opts = HygieneOptions {
+        base_dir,
+        config: hyg_cfg,
+        changeset: opts.changeset,
+        emit_text: false,
+    };
+    let files = hygiene::discover_hygiene_files(&search_paths, &hyg_opts);
+    let task_indices = files
+        .iter()
+        .map(|p| registry.register(base_dir, p, TaskRole::Hygiene))
+        .collect();
+    Some(HygienePlan { task_indices })
 }
 
 fn plan_complexity(
@@ -254,7 +289,11 @@ fn plan_i18n(
     })
 }
 
-pub(crate) fn run_shared_ast_tasks(plans: &AstCheckPlans, parallel: bool) -> Vec<SharedRustResult> {
+pub(crate) fn run_shared_ast_tasks(
+    plans: &AstCheckPlans,
+    hygiene_ignore_tests: bool,
+    parallel: bool,
+) -> Vec<SharedRustResult> {
     let macro_refs: Vec<&str> = plans
         .i18n
         .as_ref()
@@ -262,11 +301,15 @@ pub(crate) fn run_shared_ast_tasks(plans: &AstCheckPlans, parallel: bool) -> Vec
         .unwrap_or_default();
 
     parallel::map_items(&plans.tasks, parallel, |task| {
-        execute_single_task(task, &macro_refs)
+        execute_single_task(task, &macro_refs, hygiene_ignore_tests)
     })
 }
 
-fn execute_single_task(task: &SharedRustTask, macro_names: &[&str]) -> SharedRustResult {
+fn execute_single_task(
+    task: &SharedRustTask,
+    macro_names: &[&str],
+    hygiene_ignore_tests: bool,
+) -> SharedRustResult {
     let content = match fs::read_to_string(&task.path) {
         Ok(c) => c,
         Err(err) => {
@@ -285,6 +328,7 @@ fn execute_single_task(task: &SharedRustTask, macro_names: &[&str]) -> SharedRus
                 i18n_read_error: task
                     .want_i18n
                     .then(|| format!("Failed to read {}: {err}", task.path.display())),
+                hygiene_findings: None,
             };
         }
     };
@@ -311,12 +355,13 @@ fn execute_single_task(task: &SharedRustTask, macro_names: &[&str]) -> SharedRus
                 dag_imports: None,
                 i18n_keys: task.want_i18n.then(Vec::new),
                 i18n_read_error: None,
+                hygiene_findings: None,
             };
         }
     };
 
-    let suppressions =
-        (task.want_complexity || task.want_dag).then(|| FileSuppressions::parse(&content));
+    let suppressions = (task.want_complexity || task.want_dag || task.want_hygiene)
+        .then(|| FileSuppressions::parse(&content));
     let complexity_reports = task
         .want_complexity
         .then(|| complexity::scan_ast_reports(&task.path, &syntax));
@@ -324,6 +369,9 @@ fn execute_single_task(task: &SharedRustTask, macro_names: &[&str]) -> SharedRus
     let i18n_keys = task
         .want_i18n
         .then(|| i18n_source::extract_rust_keys_from_ast(&task.path, &syntax, macro_names));
+    let hygiene_findings = task
+        .want_hygiene
+        .then(|| hygiene::scan_ast_hygiene(&syntax, &content, hygiene_ignore_tests));
 
     SharedRustResult {
         suppressions,
@@ -331,6 +379,7 @@ fn execute_single_task(task: &SharedRustTask, macro_names: &[&str]) -> SharedRus
         dag_imports,
         i18n_keys,
         i18n_read_error: None,
+        hygiene_findings,
     }
 }
 
@@ -356,6 +405,7 @@ pub(crate) fn finish_complexity_outcome(
     let policy = ComplexityPolicy {
         max_function_lines: comp_cfg.max_function_lines,
         max_nesting: comp_cfg.max_nesting,
+        max_params: comp_cfg.max_params,
         overrides: &comp_cfg.overrides,
     };
 
@@ -387,6 +437,49 @@ pub(crate) fn finish_complexity_outcome(
         format!(
             "[complexity] OK: scanned {} functions across {} files, all within limit ({})",
             report_count, files_scanned, plan.max_complexity
+        )
+    });
+    Some(CheckTaskOutcome {
+        diagnostics: diags,
+        ok_line,
+    })
+}
+
+pub(crate) fn finish_hygiene_outcome(
+    plan: Option<&HygienePlan>,
+    config: &WardenConfig,
+    base_dir: &Path,
+    tasks: &[SharedRustTask],
+    results: &[SharedRustResult],
+) -> Option<CheckTaskOutcome> {
+    let plan = plan?;
+    let hyg_cfg = config.hygiene.as_ref()?;
+    let mut files_scanned = 0usize;
+    let mut diags = Vec::new();
+
+    for &idx in &plan.task_indices {
+        let res = &results[idx];
+        let (Some(findings), Some(suppressions)) = (&res.hygiene_findings, &res.suppressions)
+        else {
+            continue;
+        };
+        files_scanned += 1;
+        diags.extend(hygiene::build_hygiene_diagnostics(
+            &tasks[idx].path,
+            findings,
+            suppressions,
+            base_dir,
+            hyg_cfg,
+        ));
+    }
+
+    let ok_line = (!diags
+        .iter()
+        .any(|d| !d.suppressed && d.severity == Severity::Error))
+    .then(|| {
+        format!(
+            "[hygiene] OK: scanned {} Rust file(s), all hygiene & safety checks passed",
+            files_scanned
         )
     });
     Some(CheckTaskOutcome {

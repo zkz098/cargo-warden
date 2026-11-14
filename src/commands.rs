@@ -38,7 +38,7 @@ pub(crate) fn resolve_parallel_override(parallel: bool, no_parallel: bool) -> Op
     }
 }
 
-fn join_paths(base_dir: &Path, paths: &[PathBuf]) -> Vec<PathBuf> {
+pub(crate) fn join_paths(base_dir: &Path, paths: &[PathBuf]) -> Vec<PathBuf> {
     paths.iter().map(|p| base_dir.join(p)).collect()
 }
 
@@ -361,34 +361,6 @@ pub(crate) fn handle_ci_parity(
     )
 }
 
-pub(crate) fn handle_actions(
-    config: WardenConfig,
-    base_dir: &Path,
-    workflow: Vec<PathBuf>,
-    ignore: Vec<String>,
-    strict: bool,
-    offline: bool,
-    ctx: &RuntimeContext,
-) -> Result<()> {
-    let diagnostics = checks::actions::collect_actions_from_config(
-        &config,
-        base_dir,
-        &workflow,
-        &ignore,
-        strict,
-        offline,
-        ctx.changeset.as_ref(),
-        !ctx.format.is_structured(),
-    )?;
-    finish_single_check(
-        diagnostics,
-        &config,
-        base_dir,
-        ctx,
-        "Outdated GitHub Actions references found",
-    )
-}
-
 pub(crate) fn handle_theme(
     config: WardenConfig,
     base_dir: &Path,
@@ -546,6 +518,7 @@ pub(crate) fn handle_complexity(
     max: Option<usize>,
     max_lines: Option<usize>,
     max_nesting: Option<usize>,
+    max_params: Option<usize>,
     paths: Vec<PathBuf>,
     no_ignore_tests: bool,
     no_gitignore: bool,
@@ -566,6 +539,7 @@ pub(crate) fn handle_complexity(
     let policy = checks::complexity::ComplexityPolicy {
         max_function_lines: max_lines.or(comp_cfg.max_function_lines),
         max_nesting: max_nesting.or(comp_cfg.max_nesting),
+        max_params: max_params.or(comp_cfg.max_params),
         overrides: &comp_cfg.overrides,
     };
 

@@ -3,6 +3,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod cli;
 mod commands;
+mod commands_extra;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
@@ -12,10 +13,10 @@ use cargo_warden::config::WardenConfig;
 use cargo_warden::{doctor, gate, git, init};
 use cli::{Cli, Commands};
 use commands::{
-    RuntimeContext, handle_actions, handle_baseline, handle_check, handle_ci_parity,
-    handle_complexity, handle_dag, handle_file_length, handle_hook, handle_i18n, handle_theme,
-    resolve_parallel_override,
+    RuntimeContext, handle_baseline, handle_check, handle_ci_parity, handle_complexity, handle_dag,
+    handle_file_length, handle_hook, handle_i18n, handle_theme, resolve_parallel_override,
 };
+use commands_extra::{handle_actions, handle_hygiene, handle_manifest};
 
 fn init_tracing(verbose: u8, quiet: bool) {
     let default_directive = if quiet {
@@ -145,14 +146,29 @@ fn dispatch_command(
             workflow,
             ignore,
             strict,
+            require_sha,
+            fix,
+            pin_sha,
             offline,
-        } => handle_actions(config, base_dir, workflow, ignore, strict, offline, ctx),
+        } => handle_actions(
+            config,
+            base_dir,
+            workflow,
+            ignore,
+            strict,
+            require_sha,
+            fix,
+            pin_sha,
+            offline,
+            ctx,
+        ),
         Commands::Theme { action } => handle_theme(config, base_dir, action, ctx),
         Commands::I18n { action } => handle_i18n(config, base_dir, action, ctx),
         Commands::Complexity {
             max,
             max_lines,
             max_nesting,
+            max_params,
             paths,
             no_ignore_tests,
             no_gitignore,
@@ -162,11 +178,34 @@ fn dispatch_command(
             max,
             max_lines,
             max_nesting,
+            max_params,
             paths,
             no_ignore_tests,
             no_gitignore,
             ctx,
         ),
+        Commands::Hygiene {
+            paths,
+            forbid_unsafe,
+            forbid_expect,
+            forbid_println,
+            no_ignore_tests,
+            no_gitignore,
+        } => handle_hygiene(
+            config,
+            base_dir,
+            paths,
+            forbid_unsafe,
+            forbid_expect,
+            forbid_println,
+            no_ignore_tests,
+            no_gitignore,
+            ctx,
+        ),
+        Commands::Manifest {
+            ignore,
+            check_features,
+        } => handle_manifest(config, base_dir, ignore, check_features, ctx),
         Commands::FileLength {
             max_lines,
             ext,

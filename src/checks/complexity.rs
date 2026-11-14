@@ -29,6 +29,7 @@ pub struct ComplexityReport {
     pub score: usize,
     pub line_count: usize,
     pub max_nesting: usize,
+    pub param_count: usize,
 }
 
 #[derive(Default)]
@@ -179,6 +180,7 @@ impl FileAstScanner {
         let fn_start = sig.fn_token.span.start().line;
         let fn_end = block.brace_token.span.close().end().line;
         let line_count = fn_end.saturating_sub(fn_start) + 1;
+        let param_count = sig.inputs.len();
 
         tracing::trace!(
             function = %name,
@@ -186,6 +188,7 @@ impl FileAstScanner {
             score = calc.score,
             line_count,
             max_nesting = calc.max_nesting,
+            param_count,
             "function metrics calculated"
         );
 
@@ -196,6 +199,7 @@ impl FileAstScanner {
             score: calc.score,
             line_count,
             max_nesting: calc.max_nesting,
+            param_count,
         });
     }
 }
@@ -227,6 +231,7 @@ pub struct ComplexityOptions<'a> {
 pub struct ComplexityPolicy<'a> {
     pub max_function_lines: Option<usize>,
     pub max_nesting: Option<usize>,
+    pub max_params: Option<usize>,
     pub overrides: &'a [ComplexityOverride],
 }
 
@@ -235,6 +240,7 @@ struct EffectiveLimits {
     max_complexity: usize,
     max_function_lines: Option<usize>,
     max_nesting: Option<usize>,
+    max_params: Option<usize>,
 }
 
 fn resolve_limits(
@@ -246,6 +252,7 @@ fn resolve_limits(
         max_complexity: base_max,
         max_function_lines: policy.max_function_lines,
         max_nesting: policy.max_nesting,
+        max_params: policy.max_params,
     };
     for ov in policy.overrides {
         let matcher = PathPatternMatcher::new(&ov.paths);
@@ -258,6 +265,9 @@ fn resolve_limits(
             }
             if let Some(mn) = ov.max_nesting {
                 limits.max_nesting = Some(mn);
+            }
+            if let Some(mp) = ov.max_params {
+                limits.max_params = Some(mp);
             }
         }
     }
@@ -376,12 +386,44 @@ pub(crate) fn build_complexity_diagnostics_with_policy(
                 suppression_reason: suppressed.then(|| "inline".to_string()),
             });
         }
+
+        if let Some(max_p) = limits.max_params
+            && report.param_count > max_p
+        {
+            let suppressed = suppressions.is_suppressed("function-params", Some(report.line))
+                || suppressions.is_suppressed("complexity", Some(report.line));
+            diagnostics.push(Diagnostic {
+                rule_id: "warden/function-params".to_string(),
+                check: "complexity".to_string(),
+                severity: Severity::Error,
+                message: format!(
+                    "{}:{} - `{}()` has {} parameter(s) (> {})",
+                    rel.display(),
+                    report.line,
+                    report.function_name,
+                    report.param_count,
+                    max_p
+                ),
+                file: Some(rel.clone()),
+                line: Some(report.line),
+                column: None,
+                fingerprint: format!("function-params:{}:{}", rel_str, report.function_name),
+                metric_value: Some(report.param_count),
+                suppressed,
+                suppression_reason: suppressed.then(|| "inline".to_string()),
+            });
+        }
     }
 
     let unused = collect_unused_suppression_diagnostics(
         &rel,
         suppressions,
-        &["complexity", "function-length", "nesting-depth"],
+        &[
+            "complexity",
+            "function-length",
+            "nesting-depth",
+            "function-params",
+        ],
         &diagnostics,
     );
     diagnostics.extend(unused);

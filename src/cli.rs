@@ -129,9 +129,18 @@ pub enum Commands {
         /// Ignore specific actions (e.g. `actions/checkout` or `owner/*`)
         #[arg(long)]
         ignore: Vec<String>,
-        /// Fail with non-zero exit code when outdated actions are found
+        /// Fail with non-zero exit code when outdated or unpinned actions are found
         #[arg(long)]
         strict: bool,
+        /// Require `uses:` references to be pinned to a 40-character commit SHA
+        #[arg(long)]
+        require_sha: bool,
+        /// Automatically upgrade outdated action references in workflow files
+        #[arg(long, conflicts_with = "offline")]
+        fix: bool,
+        /// Pin action references to 40-character commit SHAs (with `# <tag>` comment)
+        #[arg(long, conflicts_with = "offline")]
+        pin_sha: bool,
         /// Only scan local workflow files without querying remote GitHub repositories
         #[arg(long)]
         offline: bool,
@@ -160,6 +169,9 @@ pub enum Commands {
         /// Maximum allowed control-flow nesting depth per function/method
         #[arg(long)]
         max_nesting: Option<usize>,
+        /// Maximum allowed parameter count per function/method
+        #[arg(long)]
+        max_params: Option<usize>,
         /// Paths or files to inspect
         #[arg(long)]
         paths: Vec<PathBuf>,
@@ -188,6 +200,38 @@ pub enum Commands {
         /// Do not respect `.gitignore` rules
         #[arg(long)]
         no_gitignore: bool,
+    },
+
+    /// Scan Rust source files for code hygiene & safety issues (`unsafe`, `.unwrap()`, `dbg!`, `todo!`)
+    Hygiene {
+        /// Paths or files to inspect
+        #[arg(long)]
+        paths: Vec<PathBuf>,
+        /// Forbid all `unsafe` blocks, functions, traits, and impls
+        #[arg(long)]
+        forbid_unsafe: bool,
+        /// Forbid `.expect()` / `.expect_err()` calls in non-test code
+        #[arg(long)]
+        forbid_expect: bool,
+        /// Forbid `println!` / `eprintln!` / `print!` / `eprint!` in non-test code
+        #[arg(long)]
+        forbid_println: bool,
+        /// Do not ignore test files or `#[test]` / `#[cfg(test)]` items
+        #[arg(long)]
+        no_ignore_tests: bool,
+        /// Do not respect `.gitignore` rules
+        #[arg(long)]
+        no_gitignore: bool,
+    },
+
+    /// Verify Cargo workspace manifest consistency (`workspace = true`, dependency sources, features)
+    Manifest {
+        /// Workspace member crate names to ignore
+        #[arg(long)]
+        ignore: Vec<String>,
+        /// Verify `#[cfg(feature = "...")]` references against `[features]`
+        #[arg(long)]
+        check_features: bool,
     },
 
     /// Run the full local verification gate (static checks + fmt + clippy + test + doc)
