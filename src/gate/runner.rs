@@ -13,9 +13,11 @@ use std::time::Instant;
 use crate::checks;
 use crate::config::{GateConfig, WardenConfig};
 
+use super::impact::{AffectedScope, compute_affected_scope};
 pub use super::steps::{
-    GateStep, Step, build_all_steps, build_filtered_all_steps, build_filtered_steps, build_steps,
-    tool_is_installed, toolchain_is_installed,
+    GateStep, Step, build_all_steps, build_all_steps_with_scope, build_filtered_all_steps,
+    build_filtered_all_steps_with_scope, build_filtered_steps, build_steps, tool_is_installed,
+    toolchain_is_installed,
 };
 
 /// Options controlling a `cargo warden gate` execution.
@@ -28,6 +30,8 @@ pub struct GateRunOptions {
     pub parallel: Option<bool>,
     pub only: Vec<String>,
     pub skip: Vec<String>,
+    /// Optional Git changeset (including deleted files) for impact-based incremental gate.
+    pub impact_changeset: Option<std::collections::BTreeSet<std::path::PathBuf>>,
 }
 
 /// Scrub `CARGO_PKG_*` and other Cargo environment variables before invoking child cargo tools.
@@ -78,9 +82,27 @@ pub fn run_gate_with_static_options(
         }
     }
 
-    let steps = build_filtered_all_steps(&gate_cfg, opts.full, opts.fix, &opts.only, &opts.skip);
+    let affected_scope = match opts.impact_changeset.as_ref().or(static_opts.changeset) {
+        Some(changed) => {
+            let scope = compute_affected_scope(root, changed)?;
+            if !static_opts.format.is_structured() {
+                print_incremental_scope(&scope);
+            }
+            scope
+        }
+        None => AffectedScope::All,
+    };
+
+    let steps = build_filtered_all_steps_with_scope(
+        &gate_cfg,
+        opts.full,
+        opts.fix,
+        &opts.only,
+        &opts.skip,
+        &affected_scope,
+    );
     if steps.is_empty() {
-        if run_checks {
+        if run_checks || matches!(affected_scope, AffectedScope::None { .. }) {
             return Ok(());
         }
         bail!("No gate steps selected to run");
@@ -95,6 +117,31 @@ pub fn run_gate_with_static_options(
         opts.keep_going,
         parallel,
     )
+}
+
+fn print_incremental_scope(scope: &AffectedScope) {
+    match scope {
+        AffectedScope::All => {
+            println!("🎯 [gate] incremental scope fallback: running full workspace gate");
+        }
+        AffectedScope::None { .. } => {
+            println!(
+                "🎯 [gate] incremental scope: 0 workspace package(s) affected (skipping clippy/test/doc)"
+            );
+        }
+        AffectedScope::Packages {
+            packages,
+            total_members,
+        } => {
+            let list: Vec<&str> = packages.iter().map(String::as_str).collect();
+            println!(
+                "🎯 [gate] incremental scope: {}/{} package(s) affected: {}",
+                packages.len(),
+                total_members,
+                list.join(", ")
+            );
+        }
+    }
 }
 
 /// Run Cargo toolchain steps configured for `cargo warden check` (e.g. `fmt`, `clippy`, `doc`).

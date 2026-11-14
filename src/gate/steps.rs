@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use super::impact::AffectedScope;
 use crate::config::{CustomStepConfig, GateConfig};
+use std::collections::BTreeSet;
 
 /// A single built-in step in the gate pipeline.
 pub struct Step {
@@ -138,30 +140,27 @@ fn build_fmt_step_with_fix(config: &GateConfig, fix: bool) -> Step {
 }
 
 fn push_test_steps(steps: &mut Vec<Step>, config: &GateConfig) {
+    push_test_steps_with_scope(steps, config, &AffectedScope::All);
+}
+
+fn push_test_steps_with_scope(steps: &mut Vec<Step>, config: &GateConfig, scope: &AffectedScope) {
+    let affected_pkgs = match scope {
+        AffectedScope::None { .. } => return,
+        AffectedScope::All => None,
+        AffectedScope::Packages { packages, .. } => Some(packages),
+    };
+
     let has_nextest = tool_is_installed("nextest");
     if config.test_groups.is_empty() {
-        let step = if has_nextest {
-            Step::cargo_tool("test", "nextest", &["nextest", "run"])
-        } else {
-            Step::cargo("test", &["test", "--workspace"])
-        };
-        steps.push(step);
-        return;
-    }
-
-    for group in &config.test_groups {
         let mut args = if has_nextest {
             vec!["nextest".to_string(), "run".to_string()]
         } else {
             vec!["test".to_string()]
         };
-        for pkg in &group.packages {
-            args.push("-p".to_string());
-            args.push(pkg.clone());
-        }
-        if !group.features.is_empty() {
-            args.push("--features".to_string());
-            args.push(group.features.join(","));
+        match affected_pkgs {
+            Some(pkgs) => push_package_flags(&mut args, pkgs),
+            None if !has_nextest => args.push("--workspace".to_string()),
+            None => {}
         }
         steps.push(Step {
             name: "test",
@@ -170,7 +169,72 @@ fn push_test_steps(steps: &mut Vec<Step>, config: &GateConfig) {
             tool: if has_nextest { Some("nextest") } else { None },
             env: Vec::new(),
         });
+        return;
     }
+
+    for group in &config.test_groups {
+        if let Some(step) = build_test_group_step(group, affected_pkgs, has_nextest) {
+            steps.push(step);
+        }
+    }
+}
+
+fn build_test_group_step(
+    group: &crate::config::TestGroupConfig,
+    affected_pkgs: Option<&BTreeSet<String>>,
+    has_nextest: bool,
+) -> Option<Step> {
+    let selected: Vec<String> = match affected_pkgs {
+        Some(pkgs) => group
+            .packages
+            .iter()
+            .filter(|p| pkgs.contains(*p))
+            .cloned()
+            .collect(),
+        None => group.packages.clone(),
+    };
+    if selected.is_empty() {
+        return None;
+    }
+    let mut args = if has_nextest {
+        vec!["nextest".to_string(), "run".to_string()]
+    } else {
+        vec!["test".to_string()]
+    };
+    for pkg in &selected {
+        args.push("-p".to_string());
+        args.push(pkg.clone());
+    }
+    if !group.features.is_empty() {
+        args.push("--features".to_string());
+        args.push(group.features.join(","));
+    }
+    Some(Step {
+        name: "test",
+        program: "cargo",
+        args,
+        tool: if has_nextest { Some("nextest") } else { None },
+        env: Vec::new(),
+    })
+}
+
+fn push_package_flags(args: &mut Vec<String>, pkgs: &BTreeSet<String>) {
+    for pkg in pkgs {
+        args.push("-p".to_string());
+        args.push(pkg.clone());
+    }
+}
+
+fn replace_workspace_flag(args: Vec<String>, pkgs: &BTreeSet<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len() + pkgs.len() * 2);
+    for arg in args {
+        if arg == "--workspace" {
+            push_package_flags(&mut out, pkgs);
+        } else {
+            out.push(arg);
+        }
+    }
+    out
 }
 
 fn build_clippy_step(config: &GateConfig) -> Step {
@@ -330,32 +394,17 @@ fn custom_to_gate_step(custom: &CustomStepConfig, fix: bool) -> GateStep {
 
 /// Build all built-in and custom gate steps (supporting `--fix` ordering and overrides).
 pub fn build_all_steps(config: &GateConfig, full: bool, fix: bool) -> Vec<GateStep> {
-    let mut steps: Vec<GateStep> = if fix {
-        // In --fix mode, run clippy --fix before rustfmt so any auto-fixed code gets formatted.
-        let mut s = vec![
-            GateStep {
-                read_only: false,
-                ..GateStep::from(build_clippy_step_with_fix(config, true))
-            },
-            GateStep {
-                read_only: false,
-                ..GateStep::from(build_fmt_step_with_fix(config, true))
-            },
-        ];
-        let mut test_steps = Vec::new();
-        push_test_steps(&mut test_steps, config);
-        s.extend(test_steps.into_iter().map(GateStep::from));
-        s.push(GateStep::from(build_doc_step(config)));
-        if full {
-            s.extend(build_full_audit_steps().into_iter().map(GateStep::from));
-        }
-        s
-    } else {
-        build_steps(config, full)
-            .into_iter()
-            .map(GateStep::from)
-            .collect()
-    };
+    build_all_steps_with_scope(config, full, fix, &AffectedScope::All)
+}
+
+/// Build all built-in and custom gate steps scoped to `scope` for incremental runs.
+pub fn build_all_steps_with_scope(
+    config: &GateConfig,
+    full: bool,
+    fix: bool,
+    scope: &AffectedScope,
+) -> Vec<GateStep> {
+    let mut steps = build_builtin_steps_with_scope(config, full, fix, scope);
 
     for custom in &config.custom_steps {
         if custom.full_only && !full {
@@ -370,6 +419,66 @@ pub fn build_all_steps(config: &GateConfig, full: bool, fix: bool) -> Vec<GateSt
     steps
 }
 
+fn scope_cargo_step(mut step: Step, scope: &AffectedScope) -> Option<Step> {
+    match scope {
+        AffectedScope::None { .. } => None,
+        AffectedScope::All => Some(step),
+        AffectedScope::Packages { packages, .. } => {
+            step.args = replace_workspace_flag(step.args, packages);
+            Some(step)
+        }
+    }
+}
+
+fn build_builtin_steps_with_scope(
+    config: &GateConfig,
+    full: bool,
+    fix: bool,
+    scope: &AffectedScope,
+) -> Vec<GateStep> {
+    let include_fmt = !matches!(
+        scope,
+        AffectedScope::None {
+            has_rust_changes: false
+        }
+    );
+    let mut steps = Vec::new();
+
+    if fix {
+        // In --fix mode, run clippy --fix before rustfmt so any auto-fixed code gets formatted.
+        if let Some(clippy) = scope_cargo_step(build_clippy_step_with_fix(config, true), scope) {
+            steps.push(GateStep {
+                read_only: false,
+                ..GateStep::from(clippy)
+            });
+        }
+        if include_fmt {
+            steps.push(GateStep {
+                read_only: false,
+                ..GateStep::from(build_fmt_step_with_fix(config, true))
+            });
+        }
+    } else {
+        if include_fmt {
+            steps.push(GateStep::from(build_fmt_step(config)));
+        }
+        if let Some(clippy) = scope_cargo_step(build_clippy_step(config), scope) {
+            steps.push(GateStep::from(clippy));
+        }
+    }
+
+    let mut test_steps = Vec::new();
+    push_test_steps_with_scope(&mut test_steps, config, scope);
+    steps.extend(test_steps.into_iter().map(GateStep::from));
+    if let Some(doc) = scope_cargo_step(build_doc_step(config), scope) {
+        steps.push(GateStep::from(doc));
+    }
+    if full {
+        steps.extend(build_full_audit_steps().into_iter().map(GateStep::from));
+    }
+    steps
+}
+
 /// Filter `build_all_steps` by `--only`, `--skip`, and `config.skip_steps`.
 pub fn build_filtered_all_steps(
     config: &GateConfig,
@@ -378,7 +487,19 @@ pub fn build_filtered_all_steps(
     only: &[String],
     skip: &[String],
 ) -> Vec<GateStep> {
-    build_all_steps(config, full, fix)
+    build_filtered_all_steps_with_scope(config, full, fix, only, skip, &AffectedScope::All)
+}
+
+/// Filter `build_all_steps_with_scope` by `--only`, `--skip`, and `config.skip_steps`.
+pub fn build_filtered_all_steps_with_scope(
+    config: &GateConfig,
+    full: bool,
+    fix: bool,
+    only: &[String],
+    skip: &[String],
+    scope: &AffectedScope,
+) -> Vec<GateStep> {
+    build_all_steps_with_scope(config, full, fix, scope)
         .into_iter()
         .filter(|step| step_selected(&step.name, config, only, skip))
         .collect()

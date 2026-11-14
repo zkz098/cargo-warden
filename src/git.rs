@@ -33,10 +33,28 @@ pub fn resolve_changeset(
     base_dir: &Path,
     scope: &ChangesetScope,
 ) -> Result<Option<BTreeSet<PathBuf>>> {
+    resolve_changeset_filtered(base_dir, scope, false)
+}
+
+/// Resolve changed relative paths including deleted files (`D`), for Gate impact analysis.
+pub fn resolve_changeset_with_deleted(
+    base_dir: &Path,
+    scope: &ChangesetScope,
+) -> Result<Option<BTreeSet<PathBuf>>> {
+    resolve_changeset_filtered(base_dir, scope, true)
+}
+
+fn resolve_changeset_filtered(
+    base_dir: &Path,
+    scope: &ChangesetScope,
+    include_deleted: bool,
+) -> Result<Option<BTreeSet<PathBuf>>> {
+    let filter = if include_deleted { "ACMRD" } else { "ACMR" };
     let mut args = vec![
         "diff",
         "--name-only",
-        "--diff-filter=ACMR",
+        "--diff-filter",
+        filter,
         "--relative",
         "-z",
     ];

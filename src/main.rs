@@ -111,6 +111,11 @@ fn main() -> Result<()> {
         git::ChangesetScope::All
     };
     let changeset = git::resolve_changeset(&base_dir, &scope)?;
+    let gate_changeset = if matches!(cli.command, Commands::Gate { .. }) && scope.is_incremental() {
+        git::resolve_changeset_with_deleted(&base_dir, &scope)?
+    } else {
+        None
+    };
 
     let ctx = RuntimeContext {
         format: cli.format.into(),
@@ -120,7 +125,7 @@ fn main() -> Result<()> {
     };
 
     let config = load_config(cli.config.as_ref(), &base_dir)?;
-    dispatch_command(cli.command, config, &base_dir, &ctx)
+    dispatch_command(cli.command, config, &base_dir, &ctx, gate_changeset)
 }
 
 fn dispatch_command(
@@ -128,6 +133,7 @@ fn dispatch_command(
     config: WardenConfig,
     base_dir: &Path,
     ctx: &RuntimeContext,
+    gate_changeset: Option<std::collections::BTreeSet<PathBuf>>,
 ) -> Result<()> {
     match command {
         Commands::Init { .. } | Commands::Completions { .. } | Commands::Doctor { .. } => {
@@ -243,6 +249,7 @@ fn dispatch_command(
                 parallel: parallel_override,
                 only,
                 skip,
+                impact_changeset: gate_changeset,
             };
             gate::runner::run_gate_with_static_options(
                 base_dir,
